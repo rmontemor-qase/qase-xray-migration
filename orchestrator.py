@@ -47,7 +47,11 @@ class MigrationOrchestrator:
         self.client = GraphQLClient(
             client_id=config["client_id"],
             client_secret=config["client_secret"],
-            jira_url=config["jira_url"]
+            jira_url=config["jira_url"],
+            jira_email=config.get("jira_email"),
+            jira_api_token=config.get("jira_api_token"),
+            jira_oauth_client_id=config.get("jira_oauth_client_id"),
+            jira_oauth_client_secret=config.get("jira_oauth_client_secret")
         )
         
         # Setup extractor

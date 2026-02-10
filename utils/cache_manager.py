@@ -23,6 +23,8 @@ class CacheManager:
         - test_executions.json
         - test_runs.json
         - attachments.json
+      /attachments/
+        - [downloaded attachment files]
       /mappings/
         - id_mappings.json
       - metadata.json
@@ -38,10 +40,12 @@ class CacheManager:
         self.cache_dir = Path(cache_dir)
         self.raw_data_dir = self.cache_dir / "raw_data"
         self.mappings_dir = self.cache_dir / "mappings"
+        self.attachments_dir = self.cache_dir / "attachments"
         
         # Create directory structure
         self.raw_data_dir.mkdir(parents=True, exist_ok=True)
         self.mappings_dir.mkdir(parents=True, exist_ok=True)
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
     
     def save_raw_data(self, entity_type: str, data: Any) -> Path:
         """
