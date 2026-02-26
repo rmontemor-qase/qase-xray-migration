@@ -4,5 +4,7 @@
   "jira_url": "https://yourcompany.atlassian.net",
   "projects": ["PROJ1", "PROJ2"],
   "jira_email": "your.email@example.com",
-  "jira_api_token": "YOUR_JIRA_API_TOKEN"
+  "jira_api_token": "YOUR_JIRA_API_TOKEN",
+  "qase_host": "https://api.qase.io/v1",
+  "qase_api_token": "YOUR_QASE_API_TOKEN"
 }

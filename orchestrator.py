@@ -7,6 +7,10 @@ from utils.cache_manager import CacheManager
 from utils.graphql_client import GraphQLClient
 from utils.logger import get_logger
 from extractors.xray_cloud_extractor import XrayCloudExtractor
+from transformers.xray_transformer import XrayTransformer
+from loaders.qase_loader import QaseLoader
+from services.qase_service import QaseService
+from models.mappings import MappingStore
 
 logger = get_logger(__name__)
 
@@ -56,6 +60,33 @@ class MigrationOrchestrator:
         
         # Setup extractor
         self.extractor = XrayCloudExtractor(self.cache_manager, self.client)
+        
+        # Setup transformer
+        # Load existing mappings if available
+        self.mappings = None
+        try:
+            mappings_path = self.cache_manager.mappings_dir / "id_mappings.json"
+            if mappings_path.exists():
+                import json
+                with open(mappings_path, "r") as f:
+                    mappings_data = json.load(f)
+                    self.mappings = MappingStore.from_dict(mappings_data)
+        except Exception as e:
+            self.logger.warning(f"Could not load existing mappings: {e}")
+        
+        self.transformer = XrayTransformer(self.cache_manager, self.mappings)
+        
+        # Setup loader (if Qase credentials provided)
+        self.loader = None
+        if config.get("qase_api_token") and config.get("qase_host"):
+            qase_service = QaseService(
+                api_token=config["qase_api_token"],
+                qase_host=config.get("qase_host", "https://api.qase.io/v1")
+            )
+            # Use the same mappings instance as transformer
+            if self.mappings is None:
+                self.mappings = self.transformer.mappings
+            self.loader = QaseLoader(self.cache_manager, qase_service, self.mappings)
     
     def _validate_config(self):
         """Validate configuration file."""
@@ -84,12 +115,9 @@ class MigrationOrchestrator:
         
         Returns:
             Transformation statistics
-        
-        Note: Not yet implemented - placeholder for future work
         """
         self.logger.info("Starting TRANSFORM phase...")
-        self.logger.warning("Transform phase not yet implemented")
-        return {"status": "not_implemented"}
+        return self.transformer.transform()
     
     def load(self) -> Dict[str, Any]:
         """
@@ -97,12 +125,16 @@ class MigrationOrchestrator:
         
         Returns:
             Load statistics
-        
-        Note: Not yet implemented - placeholder for future work
         """
         self.logger.info("Starting LOAD phase...")
-        self.logger.warning("Load phase not yet implemented")
-        return {"status": "not_implemented"}
+        
+        if not self.loader:
+            raise ValueError(
+                "Qase credentials not configured. "
+                "Please provide 'qase_api_token' and 'qase_host' in config."
+            )
+        
+        return self.loader.load()
     
     def migrate(self) -> Dict[str, Any]:
         """

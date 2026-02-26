@@ -63,7 +63,6 @@ def cmd_extract(args):
 def cmd_transform(args):
     """Run transformation phase."""
     logger = get_logger(__name__)
-    logger.error("Transform phase is NOT YET IMPLEMENTED. Only extract phase is available.")
     
     try:
         cache_dir = Path(args.cache)
@@ -76,14 +75,16 @@ def cmd_transform(args):
         setup_logger(log_file=str(log_file), level=args.log_level)
         
         # Load config from cache or use provided config
+        # Config is optional for transform - we only need it for validation
+        config = {}
         if args.config:
             config = load_config(args.config)
         else:
+            # Try to load minimal config from cache metadata
             cache_manager = CacheManager(cache_dir)
             metadata = cache_manager.load_metadata()
-            if not metadata:
-                raise ValueError("No metadata found in cache. Please provide --config")
-            config = {}  # Minimal config for transform
+            if metadata:
+                logger.info("Using cached metadata for transformation")
         
         # Create orchestrator with existing cache
         orchestrator = MigrationOrchestrator(config, cache_dir=cache_dir)
@@ -91,7 +92,11 @@ def cmd_transform(args):
         # Run transformation
         stats = orchestrator.transform()
         
-        logger.info("Transformation completed")
+        transformed_dir = cache_dir / "transformed"
+        logger.info(f"Transformation completed successfully!")
+        logger.info(f"Transformed data saved to: {transformed_dir}")
+        logger.info(f"Statistics: {stats.get('stats', {})}")
+        
         return 0
         
     except Exception as e:
@@ -102,7 +107,6 @@ def cmd_transform(args):
 def cmd_load(args):
     """Run load phase."""
     logger = get_logger(__name__)
-    logger.error("Load phase is NOT YET IMPLEMENTED. Only extract phase is available.")
     
     try:
         cache_dir = Path(args.cache)
@@ -114,8 +118,14 @@ def cmd_load(args):
         log_file = args.log_file or (cache_dir / "load.log")
         setup_logger(log_file=str(log_file), level=args.log_level)
         
-        # Load config
+        # Load config (required for Qase credentials)
         config = load_config(args.config)
+        
+        # Validate Qase credentials
+        if not config.get("qase_api_token"):
+            raise ValueError("Missing 'qase_api_token' in config")
+        if not config.get("qase_host"):
+            raise ValueError("Missing 'qase_host' in config")
         
         # Create orchestrator with existing cache
         orchestrator = MigrationOrchestrator(config, cache_dir=cache_dir)
@@ -123,7 +133,8 @@ def cmd_load(args):
         # Run load
         stats = orchestrator.load()
         
-        logger.info("Load completed")
+        logger.info("Load completed successfully!")
+        logger.info(f"Statistics: {stats.get('stats', {})}")
         return 0
         
     except Exception as e:
@@ -170,11 +181,11 @@ Examples:
   # Extract with custom config file
   python cli.py extract --config config.json
   
-  # Transform cached data (NOT YET IMPLEMENTED)
+  # Transform cached data
   python cli.py transform --cache ./cache/xray_extraction_20260205_143022/
   
-  # Load transformed data into Qase (NOT YET IMPLEMENTED)
-  python cli.py load --cache ./cache/xray_extraction_20260205_143022/
+  # Load transformed data into Qase
+  python cli.py load --cache ./cache/xray_extraction_20260205_143022/ --config config.json
   
   # Run all phases at once (ONLY EXTRACT WORKS)
   python cli.py migrate
@@ -206,7 +217,7 @@ Examples:
     extract_parser.set_defaults(func=cmd_extract)
     
     # Transform command
-    transform_parser = subparsers.add_parser("transform", help="Transform cached data to Qase format (NOT YET IMPLEMENTED)")
+    transform_parser = subparsers.add_parser("transform", help="Transform cached data to Qase format")
     transform_parser.add_argument(
         "--cache",
         required=True,
@@ -220,7 +231,7 @@ Examples:
     transform_parser.set_defaults(func=cmd_transform)
     
     # Load command
-    load_parser = subparsers.add_parser("load", help="Load transformed data into Qase (NOT YET IMPLEMENTED)")
+    load_parser = subparsers.add_parser("load", help="Load transformed data into Qase")
     load_parser.add_argument(
         "--cache",
         required=True,
