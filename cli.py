@@ -145,7 +145,6 @@ def cmd_load(args):
 def cmd_migrate(args):
     """Run all phases in sequence."""
     logger = get_logger(__name__)
-    logger.warning("Only EXTRACT phase is implemented. Transform and Load phases will be skipped.")
     
     try:
         config = load_config(args.config)
@@ -175,7 +174,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract data from Xray Cloud (ONLY THIS IS IMPLEMENTED)
+  # Extract data from Xray Cloud
   python cli.py extract
   
   # Extract with custom config file
@@ -187,7 +186,7 @@ Examples:
   # Load transformed data into Qase
   python cli.py load --cache ./cache/xray_extraction_20260205_143022/ --config config.json
   
-  # Run all phases at once (ONLY EXTRACT WORKS)
+  # Run extract, transform, and load in sequence (requires Qase credentials in config)
   python cli.py migrate
         """
     )
@@ -245,7 +244,7 @@ Examples:
     load_parser.set_defaults(func=cmd_load)
     
     # Migrate command
-    migrate_parser = subparsers.add_parser("migrate", help="Run all phases (extract, transform, load) - ONLY EXTRACT WORKS")
+    migrate_parser = subparsers.add_parser("migrate", help="Run all phases: extract, transform, load")
     migrate_parser.add_argument(
         "--config",
         default="config.json",

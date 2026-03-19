@@ -1,150 +1,130 @@
-# Xray Cloud to Qase Migration Tool
+# Xray Cloud → Qase migration tool
 
-A modular migration tool for extracting test data from Xray Cloud (via GraphQL API) and migrating it to Qase test management platform.
+Python CLI that pulls test data from **Xray Cloud** (GraphQL), maps it to **Qase** shapes, and imports it via the Qase API (official Python clients).
+
+Phases:
+
+1. **Extract** — Xray projects, folders, test cases, test executions, test runs, and attachments (with optional file download).
+2. **Transform** — Qase-oriented JSON under `transformed/` (projects, suites, cases, attachment map, runs, results) plus ID mappings.
+3. **Load** — Creates entities in Qase in dependency order (projects → attachments → suite/case updates → suites → cases → runs/results).
 
 ## Prerequisites
 
-- Python 3.8 or higher
-- Xray Cloud account with API credentials
-- Access to Jira Cloud instance linked to Xray
+- Python 3.8+
+- Xray Cloud API credentials (Client ID / Secret) and Jira Cloud base URL
+- Qase API token and API base URL (for `load` / full `migrate` only)
 
 ## Installation
 
-1. Clone this repository:
 ```bash
 git clone <repository-url>
 cd qase-xray-migration
-```
-
-2. Create and activate virtual environment:
-
-**Windows:**
-```bash
-python -m venv venv
-venv\Scripts\activate
-```
-
-**Unix/Linux/Mac:**
-```bash
 python3 -m venv venv
-source venv/bin/activate
-```
-
-3. Install dependencies:
-```bash
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+Dependencies include `requests`, `tqdm`, and Qase SDK packages (`qase-api-client`, `qase-api-v2-client`).
+
 ## Configuration
 
-1. Copy the example config file:
+Copy the example file and edit values:
+
 ```bash
 cp config.json.example config.json
 ```
 
-2. Edit `config.json` with your credentials:
-```json
-{
-  "client_id": "YOUR_XRAY_CLIENT_ID",
-  "client_secret": "YOUR_XRAY_CLIENT_SECRET",
-  "jira_url": "https://yourcompany.atlassian.net",
-  "projects": ["PROJ1", "PROJ2"],
-  "jira_oauth_client_id": "YOUR_JIRA_OAUTH_CLIENT_ID",
-  "jira_oauth_client_secret": "YOUR_JIRA_OAUTH_CLIENT_SECRET"
-}
-```
+### Required for extraction (and for the orchestrator)
 
-**Note:** `jira_oauth_client_id` and `jira_oauth_client_secret` are optional but required for downloading attachments.
+| Field | Description |
+| --- | --- |
+| `client_id` | Xray Cloud API Client ID |
+| `client_secret` | Xray Cloud API Client Secret |
+| `jira_url` | Jira Cloud base URL (e.g. `https://yourcompany.atlassian.net`) |
+| `projects` | List of Jira project keys to migrate (e.g. `["PROJ1", "PROJ2"]`) |
 
-### Getting API Credentials
+### Jira — attachment downloads (recommended)
 
-#### Xray Cloud API Credentials (Required)
+Attachment binaries are fetched from Jira; without credentials, attachment download may be skipped while GraphQL metadata can still be stored.
 
-1. Log in to your Jira Cloud instance (e.g., `https://yourcompany.atlassian.net`)
-2. Navigate to **Apps** → **Xray** → **Settings** → **API Keys**
-   - Or: **Settings** → **Apps** → **Manage apps** → **Xray** → **Configure** → **API Keys**
-3. Create a new API key and copy the **Client ID** and **Client Secret** (secret shown only once!)
-4. Use your Jira URL as `jira_url` (e.g., `https://yourcompany.atlassian.net`)
-5. Add project keys (the prefix before issue numbers, e.g., `TEST-123` → key is `TEST`)
+| Field | Description |
+| --- | --- |
+| `jira_email` | Atlassian account email |
+| `jira_api_token` | Jira API token (scoped token with `read:attachment:jira` is preferred) |
 
-#### Jira API Credentials (Required for Attachment Downloads)
+Optional OAuth (alternative or additional path, depending on your setup):
 
-**✅ Recommended: Scoped API Token (Most Secure)**
+| Field | Description |
+| --- | --- |
+| `jira_oauth_client_id` | Jira OAuth 2.0 app client ID |
+| `jira_oauth_client_secret` | Jira OAuth 2.0 app client secret |
 
-For better security, use a **scoped API token** with only the permissions needed for attachment downloads:
+### Qase — required for `load` and `migrate`
 
-1. Create a scoped token with `read:attachment:jira` scope
-   - This limits the token to only read attachments, reducing security risk
-2. Add to `config.json`:
-   - `jira_email`: Your Atlassian account email
-   - `jira_api_token`: The scoped API token
+| Field | Description |
+| --- | --- |
+| `qase_host` | Qase API v1 base URL (default in example: `https://api.qase.io/v1`) |
+| `qase_api_token` | Personal API token from your Qase workspace (Settings → API tokens) |
 
-**Scoped tokens work the same way as regular tokens** - they use Basic Auth format (`email:token`) but have limited permissions.
+### Optional
 
-**Option: Personal API Token (Full Permissions)**
+| Field | Description |
+| --- | --- |
+| `cache_dir` | Parent directory for timestamped extraction folders (default: `cache`) |
 
-If scoped tokens aren't available, you can use a regular personal API token:
+**Security:** Never commit `config.json`. Use scoped Jira tokens where possible and rotate credentials if exposed.
 
-1. Go to https://id.atlassian.com/manage-profile/security/api-tokens
-2. Click **Create API token**
-3. Give it a label (e.g., "Xray Migration - Attachments")
-4. Copy the token (shown only once!)
-5. Add to `config.json`:
-   - `jira_email`: Your Atlassian account email
-   - `jira_api_token`: The personal API token
+### Getting Xray API credentials
 
-**⚠️ Security Best Practices:**
-- **Prefer scoped tokens** with `read:attachment:jira` scope when available
-- Use a dedicated service account with minimal permissions
-- Rotate tokens regularly
-- Store tokens securely (never commit to version control)
-- Revoke immediately if compromised
+1. Open your Jira Cloud instance.
+2. Go to **Apps** → **Xray** → **Settings** → **API Keys** (or **Manage apps** → Xray → **Configure** → **API Keys**).
+3. Create a key pair; copy **Client ID** and **Client Secret** (secret is shown once).
 
-**Note:** Without Jira Basic Auth credentials (`jira_email` and `jira_api_token`), attachment downloads will fail. The script will skip attachment downloads if these credentials are not provided.
+### Getting a Jira API token
+
+Create a token at [Atlassian API tokens](https://id.atlassian.com/manage-profile/security/api-tokens). Prefer a **scoped** token with `read:attachment:jira` for least privilege.
 
 ## Usage
 
-### Extract Phase (✅ IMPLEMENTED)
+Global options (all commands):
 
-Extract data from Xray Cloud and save to cache:
+- `--log-level` — `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`)
+- `--log-file` — Override log path (defaults: `logs/extraction.log` or `logs/migration.log` for extract/migrate; `{cache}/transform.log` and `{cache}/load.log` for transform/load)
+
+### Extract
 
 ```bash
 python cli.py extract
-```
-
-Or with a custom config file:
-```bash
 python cli.py extract --config config.json
 ```
 
-This will:
-- Authenticate with Xray Cloud
-- Extract projects, folders, test cases, test executions, and attachments
-- Download attachment files locally (requires `jira_oauth_client_id` and `jira_oauth_client_secret` in config)
-- Save all data to `./cache/xray_extraction_[timestamp]/`
-- Create metadata and error logs
+Creates `cache/xray_extraction_YYYYMMDD_HHMMSS/` with raw JSON, downloaded files under `attachments/`, `metadata.json`, and `extraction_errors.log` on failures.
 
-### Transform Phase (❌ NOT YET IMPLEMENTED)
+### Transform
 
 ```bash
 python cli.py transform --cache ./cache/xray_extraction_20260205_143022/
 ```
 
-### Load Phase (❌ NOT YET IMPLEMENTED)
+Reads raw cache files and writes `transformed/` plus updates `mappings/id_mappings.json`. Default `--config` is `config.json`; the orchestrator still validates Xray fields, so keep a valid Xray section in config.
+
+### Load
 
 ```bash
-python cli.py load --cache ./cache/xray_extraction_20260205_143022/
+python cli.py load --cache ./cache/xray_extraction_20260205_143022/ --config config.json
 ```
 
-### Full Migration (⚠️ PARTIALLY IMPLEMENTED)
+Requires `qase_api_token` and `qase_host`. Import order: projects → attachment uploads → case attachment hashes → suites (hierarchical) → cases (bulk) → runs and results when present.
+
+### Full pipeline
 
 ```bash
-python cli.py migrate
+python cli.py migrate --config config.json
 ```
 
-**Status:** Only the extract phase is implemented. Transform and load phases will be skipped with warnings.
+Runs **extract → transform → load** in one process using a newly created cache directory. You must supply Qase credentials in config for the load step to succeed.
 
-## Cache Structure
+## Cache layout
 
 ```
 cache/
@@ -154,53 +134,83 @@ cache/
     │   ├── folders.json
     │   ├── test_cases.json
     │   ├── test_executions.json
+    │   ├── test_runs.json
     │   └── attachments.json
-    ├── attachments/
-    │   └── [downloaded attachment files]
+    ├── attachments/              # Downloaded files (when Jira auth works)
+    ├── transformed/              # After transform
+    │   ├── projects.json
+    │   ├── suites.json
+    │   ├── cases.json
+    │   ├── attachments_map.json
+    │   ├── runs.json
+    │   └── results.json
     ├── mappings/
     │   └── id_mappings.json
     ├── metadata.json
-    └── extraction_errors.log
+    ├── extraction_errors.log
+    ├── transform.log             # Default log for transform
+    └── load.log                  # Default log for load
 ```
 
 ## Troubleshooting
 
-### Authentication Errors
-- Verify your `client_id` and `client_secret` are correct
-- Ensure your API key has proper permissions in Xray Cloud
-- Check that your Jira URL is correct and accessible
-- **For attachment download errors:**
-  - **401 Unauthorized:** Add `jira_oauth_client_id` and `jira_oauth_client_secret` to your `config.json` (see "Getting API Credentials" above)
-  - **403 Forbidden:** Your account doesn't have permission to access the attachment. Possible causes:
-    - Attachment is restricted/private
-    - Your Jira account doesn't have access to the project/issue
-    - OAuth app lacks sufficient permissions
-    - Jira instance security settings restrict attachment access
-    - **Solution:** Verify you can access the attachment in Jira web interface, or skip downloading attachments for now (metadata is still saved)
+### Xray / Jira authentication
 
-### Rate Limit Errors
-- The tool automatically handles rate limits (300 requests/5min)
-- If you see frequent warnings, consider reducing the number of projects migrated at once
+- Confirm `client_id`, `client_secret`, and `jira_url`.
+- Ensure the API key is enabled in Xray and project keys exist.
 
-### ModuleNotFoundError
-- Make sure your virtual environment is activated
-- Run `pip install -r requirements.txt`
+### Attachment download (401 / 403)
 
-## API Documentation
+- **401:** Add valid `jira_email` + `jira_api_token`, or configure OAuth fields if that is your intended path.
+- **403:** Issue or project permissions, or attachment restrictions in Jira. Confirm access in the Jira UI; extraction can still persist metadata without files.
 
-**Xray Cloud GraphQL API Documentation:**
-https://us.xray.cloud.getxray.app/doc/graphql/index.html
+### Rate limits
 
-## Project Structure
+The GraphQL client targets Xray’s typical limit (**300 requests per 5 minutes**) with backoff. Migrating many projects at once may trigger throttling—run smaller batches if needed.
+
+### Load / Qase errors
+
+- Verify `qase_api_token` and `qase_host`.
+- Ensure `transform` completed so `transformed/` exists before `load`.
+
+### Import errors
+
+- Activate the virtual environment and run `pip install -r requirements.txt`.
+
+## API references
+
+- [Xray Cloud GraphQL documentation](https://us.xray.cloud.getxray.app/doc/graphql/index.html)
+- [Qase API](https://developers.qase.io/) (v1 for most entities; v2 client used for results)
+
+## Project structure
 
 ```
 qase-xray-migration/
-├── cli.py                    # Command-line interface
-├── orchestrator.py           # Migration coordinator
+├── cli.py                          # Entrypoint (extract | transform | load | migrate)
+├── orchestrator.py                 # Wires extract → transform → load
 ├── config.json.example
+├── requirements.txt
 ├── extractors/
+│   ├── base_extractor.py
+│   └── xray_cloud_extractor.py
 ├── repositories/
+│   └── xray_cloud_repository.py    # Xray GraphQL queries
+├── transformers/
+│   ├── xray_transformer.py         # Orchestrates sub-transformers
+│   ├── project_transformer.py
+│   ├── suite_transformer.py
+│   ├── case_transformer.py
+│   ├── attachment_transformer.py
+│   └── run_transformer.py
+├── loaders/
+│   └── qase_loader.py
+├── services/
+│   └── qase_service.py             # Qase SDK wrapper (v1 + v2)
 ├── models/
-├── utils/
-└── requirements.txt
+│   ├── xray_models.py
+│   └── mappings.py
+└── utils/
+    ├── cache_manager.py
+    ├── graphql_client.py
+    └── logger.py
 ```
