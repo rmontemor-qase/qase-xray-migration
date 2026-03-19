@@ -1,6 +1,6 @@
 """Extractor for Xray Cloud using GraphQL API."""
 
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 from tqdm import tqdm
 
@@ -10,6 +10,96 @@ from utils.graphql_client import GraphQLClient
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _project_from_jira_issue_blob(jira: Any) -> Optional[Dict[str, str]]:
+    """Read Jira project id/key/name from Xray's embedded `jira` object on an issue."""
+    if not isinstance(jira, dict):
+        return None
+    proj = jira.get("project")
+    if not isinstance(proj, dict):
+        return None
+    pid = proj.get("id")
+    if pid is None:
+        return None
+    key = (proj.get("key") or "").strip()
+    name = (proj.get("name") or key or "").strip()
+    return {"id": str(pid), "key": key, "name": name}
+
+
+def _add_xray_evidence_attachment(
+    attachments_seen: Dict[str, Dict[str, Any]],
+    file_id: str,
+    filename: str,
+    download_link: str,
+) -> None:
+    """Register a test-run evidence / step file hosted on Xray Cloud (UUID + getxray.app URL)."""
+    if not file_id or not download_link:
+        return
+    sid = str(file_id).strip()
+    if sid in attachments_seen:
+        return
+    attachments_seen[sid] = {
+        "id": sid,
+        "filename": (filename or f"evidence_{sid[:8]}").strip(),
+        "content": download_link,
+        "_source": "xray_cloud",
+    }
+
+
+def _merge_xray_test_run_attachments(
+    executions: List[Dict[str, Any]],
+    attachments_seen: Dict[str, Dict[str, Any]],
+) -> None:
+    """Collect evidence + step attachment rows from nested test runs (not Jira issue attachments)."""
+    for execution in executions or []:
+        for tr in (execution.get("testRuns") or {}).get("results") or []:
+            if not isinstance(tr, dict):
+                continue
+            for ev in tr.get("evidence") or []:
+                if isinstance(ev, dict) and ev.get("id") and ev.get("downloadLink"):
+                    _add_xray_evidence_attachment(
+                        attachments_seen,
+                        str(ev["id"]),
+                        str(ev.get("filename") or ""),
+                        str(ev["downloadLink"]),
+                    )
+            for step in tr.get("steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                for ev in step.get("evidence") or []:
+                    if isinstance(ev, dict) and ev.get("id") and ev.get("downloadLink"):
+                        _add_xray_evidence_attachment(
+                            attachments_seen,
+                            str(ev["id"]),
+                            str(ev.get("filename") or ""),
+                            str(ev["downloadLink"]),
+                        )
+                for att in step.get("attachments") or []:
+                    if isinstance(att, dict) and att.get("id") and att.get("downloadLink"):
+                        _add_xray_evidence_attachment(
+                            attachments_seen,
+                            str(att["id"]),
+                            str(att.get("filename") or ""),
+                            str(att["downloadLink"]),
+                        )
+
+
+def _collect_project_hints_from_issues(
+    test_cases: List[Dict[str, Any]],
+    executions: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, str]]:
+    """Best-effort project metadata from issue `jira.project` (works without Jira REST)."""
+    hints: Dict[str, Dict[str, str]] = {}
+    for test in test_cases:
+        info = _project_from_jira_issue_blob(test.get("jira"))
+        if info:
+            hints[info["id"]] = info
+    for execution in executions:
+        info = _project_from_jira_issue_blob(execution.get("jira"))
+        if info:
+            hints[info["id"]] = info
+    return hints
 
 
 class XrayCloudExtractor(BaseExtractor):
@@ -72,9 +162,8 @@ class XrayCloudExtractor(BaseExtractor):
         all_test_executions = []
         all_attachments = []
         attachment_ids = set()
-        
-        # Projects and folders will be derived from test cases (Xray GraphQL only)
-        # No need to call Jira REST API for projects - we'll extract everything from Xray GraphQL
+        # Xray GraphQL returns projectId on tests, not the Jira project name; map id -> key while extracting.
+        project_id_to_key: Dict[str, str] = {}
         
         # Extract tests and executions for each project (using Xray GraphQL only)
         self.logger.info("=" * 60)
@@ -89,6 +178,11 @@ class XrayCloudExtractor(BaseExtractor):
                     tests = self.repository.get_tests(project_key)
                     all_test_cases.extend(tests)
                     stats["test_cases"] += len(tests)
+                    
+                    for test in tests:
+                        pid = test.get("projectId")
+                        if pid is not None:
+                            project_id_to_key[str(pid)] = project_key
                     
                     # Collect attachment IDs from tests
                     attachment_count = 0
@@ -131,6 +225,24 @@ class XrayCloudExtractor(BaseExtractor):
                         test_runs = execution.get("testRuns", {}).get("results", [])
                         stats["test_runs"] += len(test_runs)
                         
+                        for tr in test_runs:
+                            if not isinstance(tr, dict):
+                                continue
+                            for ev in tr.get("evidence") or []:
+                                if isinstance(ev, dict):
+                                    eid = ev.get("id")
+                                    if eid:
+                                        attachment_ids.add(str(eid))
+                            for step in tr.get("steps") or []:
+                                if not isinstance(step, dict):
+                                    continue
+                                for ev in step.get("evidence") or []:
+                                    if isinstance(ev, dict) and ev.get("id"):
+                                        attachment_ids.add(str(ev["id"]))
+                                for att in step.get("attachments") or []:
+                                    if isinstance(att, dict) and att.get("id"):
+                                        attachment_ids.add(str(att["id"]))
+                        
                         # Collect attachments from execution Jira data
                         jira_data = execution.get("jira", {})
                         attachments = jira_data.get("attachment", [])
@@ -159,38 +271,93 @@ class XrayCloudExtractor(BaseExtractor):
                 self.errors.append(error_msg)
                 stats["errors"] += 1
         
-        # Derive project info from test cases (always derive from Xray GraphQL data)
+        # Jira REST supplies real project names; Xray GraphQL only gives projectId on tests.
         self.logger.info("=" * 60)
-        self.logger.info("PHASE 1: Deriving Projects from Test Cases")
+        self.logger.info("PHASE 1: Resolving project names (Jira REST)")
         self.logger.info("=" * 60)
         
-        if len(all_test_cases) > 0:
-            self.logger.info("Deriving project information from test cases...")
-            project_ids_seen = set()
-            # Map project IDs to their keys from config
-            project_id_to_key = {}
-            for test in all_test_cases:
-                project_id = test.get("projectId")
-                if project_id and project_id not in project_ids_seen:
-                    project_ids_seen.add(project_id)
-                    # Find matching project key from config
-                    # Try to match by checking if test's projectId matches any known project
-                    # For now, use the first project key from config (we can improve this later)
-                    matching_key = project_keys[0] if project_keys else "UNKNOWN"
-                    project_id_to_key[project_id] = matching_key
-                    # Create a project entry
-                    all_projects.append({
-                        "id": project_id,
-                        "key": matching_key,
-                        "name": f"Project {matching_key}",
-                        "derived_from_tests": True
-                    })
-            if all_projects:
-                stats["projects"] = len(all_projects)
-                self.cache_manager.save_raw_data("projects", all_projects)
-                self.logger.info(f"Derived {len(all_projects)} project(s) from test cases")
+        fetched: List[Dict[str, Any]] = []
+        try:
+            fetched = self.repository.get_projects(project_keys)
+        except Exception as e:
+            self.logger.warning(f"Could not fetch projects from Jira REST API: {e}")
+        
+        jira_by_id: Dict[str, Dict[str, Any]] = {}
+        for p in fetched:
+            if not isinstance(p, dict) or p.get("id") is None:
+                continue
+            pid = str(p["id"])
+            jkey = p.get("key") or ""
+            jira_by_id[pid] = {
+                "id": pid,
+                "key": jkey,
+                "name": p.get("name") or jkey or "Unknown",
+            }
+        
+        issue_hints = _collect_project_hints_from_issues(all_test_cases, all_test_executions)
+        for pid, hint in issue_hints.items():
+            if pid not in jira_by_id:
+                jira_by_id[pid] = {
+                    "id": pid,
+                    "key": hint.get("key") or project_id_to_key.get(pid, ""),
+                    "name": hint.get("name") or hint.get("key") or project_id_to_key.get(pid, "") or "Unknown",
+                }
+            else:
+                row = jira_by_id[pid]
+                hint_name = (hint.get("name") or "").strip()
+                if hint_name and (not row.get("name") or row.get("name") == row.get("key")):
+                    row["name"] = hint_name
+                if hint.get("key") and not row.get("key"):
+                    row["key"] = hint["key"]
+        
+        ordered_pids: List[str] = []
+        seen_pid: set = set()
+        key_upper_to_pid: Dict[str, str] = {
+            row["key"].upper(): pid for pid, row in jira_by_id.items() if row.get("key")
+        }
+        if jira_by_id:
+            for pk in project_keys:
+                pid_opt: Optional[str] = key_upper_to_pid.get(pk.upper())
+                if pid_opt and pid_opt not in seen_pid:
+                    seen_pid.add(pid_opt)
+                    ordered_pids.append(pid_opt)
+            for pid in sorted(project_id_to_key.keys()):
+                if pid not in seen_pid:
+                    seen_pid.add(pid)
+                    ordered_pids.append(pid)
         else:
-            self.logger.warning("No test cases found - cannot derive project information")
+            ordered_pids = sorted(project_id_to_key.keys())
+        
+        for pid in ordered_pids:
+            if pid in jira_by_id:
+                all_projects.append(dict(jira_by_id[pid]))
+            else:
+                pk = project_id_to_key.get(pid, "")
+                all_projects.append({
+                    "id": pid,
+                    "key": pk,
+                    "name": pk if pk else "Unknown",
+                    "derived_from_tests": True,
+                })
+        
+        if all_projects:
+            stats["projects"] = len(all_projects)
+            self.cache_manager.save_raw_data("projects", all_projects)
+            self.logger.info(f"Resolved {len(all_projects)} project(s) for cache")
+            if not fetched:
+                self.logger.info(
+                    "Jira REST returned no project records (optional: set jira_email + jira_api_token)."
+                )
+            if issue_hints:
+                self.logger.info(
+                    "Enriched project names from jira.project on extracted issues where available."
+                )
+            if not issue_hints and not fetched:
+                self.logger.warning(
+                    "No jira.project on issues and no Jira REST data — project titles may be keys only."
+                )
+        elif not ordered_pids:
+            self.logger.warning("No projects resolved (no tests and no Jira project data)")
         
         # Derive folders from test cases (always derive from Xray GraphQL data)
         self.logger.info("=" * 60)
@@ -267,41 +434,39 @@ class XrayCloudExtractor(BaseExtractor):
                         att_id = attachment.get("id") or attachment.get("attachmentId")
                         if att_id and str(att_id) not in attachments_seen:
                             attachments_seen[str(att_id)] = attachment
+
+            _merge_xray_test_run_attachments(all_test_executions, attachments_seen)
             
             if attachments_seen:
                 all_attachments.extend(list(attachments_seen.values()))
                 stats["attachments"] = len(all_attachments)
                 
-                # Download attachment files (requires Basic Auth - email + API token)
-                # OAuth 2.0 doesn't work for Jira Cloud REST API (requires user interaction)
                 has_jira_creds = bool(
                     self.client.jira_email and self.client.jira_api_token
                 )
+                has_xray_evidence = any(
+                    a.get("_source") == "xray_cloud" for a in all_attachments
+                )
+                self.logger.info("=" * 60)
+                self.logger.info("PHASE 3: Downloading Attachment Files")
+                self.logger.info("=" * 60)
                 if has_jira_creds:
-                    self.logger.info("=" * 60)
-                    self.logger.info("PHASE 3: Downloading Attachment Files")
-                    self.logger.info("=" * 60)
-                    
-                    # Test Jira authentication first
-                    self.logger.info("Testing Jira authentication credentials...")
+                    self.logger.info("Testing Jira authentication (for Jira-hosted attachments)...")
                     auth_works = self.client.test_jira_auth()
                     if not auth_works:
-                        self.logger.error("❌ Jira authentication test failed!")
-                        self.logger.error("   Please verify your Jira credentials in config.json")
-                        self.logger.error("   Skipping attachment downloads due to authentication failure")
-                        self.errors.append("Jira authentication test failed - cannot download attachments")
-                    else:
-                        self._download_attachments(all_attachments)
+                        self.logger.error(
+                            "Jira authentication test failed — Jira attachments may not download."
+                        )
+                        self.errors.append("Jira authentication test failed - Jira attachment download may fail")
                 else:
-                    self.logger.warning("=" * 60)
-                    self.logger.warning("PHASE 3: Skipping Attachment File Downloads")
-                    self.logger.warning("=" * 60)
-                    self.logger.warning("Jira credentials not provided.")
-                    self.logger.warning("Attachment metadata will be saved, but files will not be downloaded.")
-                    self.logger.warning("To download attachments, add either:")
-                    self.logger.warning("  - 'jira_email' and 'jira_api_token' for Basic Auth, OR")
-                    self.logger.warning("  - 'jira_oauth_client_id' and 'jira_oauth_client_secret' for OAuth 2.0")
-                    self.logger.warning("Attachments can be downloaded later during Transform/Load phase if needed.")
+                    self.logger.warning(
+                        "No jira_email/jira_api_token: Jira issue attachments will not download."
+                    )
+                if has_xray_evidence:
+                    self.logger.info(
+                        "Xray Cloud test-run evidence uses Xray client credentials (same as GraphQL)."
+                    )
+                self._download_attachments(all_attachments)
                 
                 self.cache_manager.save_raw_data("attachments", all_attachments)
                 self.logger.info(f"Successfully extracted {len(all_attachments)} attachment(s) from test data")
@@ -353,8 +518,13 @@ class XrayCloudExtractor(BaseExtractor):
         for attachment in tqdm(attachments, desc="Downloading attachments"):
             try:
                 attachment_id = str(attachment.get("id") or attachment.get("attachmentId", ""))
-                content_url = attachment.get("content")
+                content_url = attachment.get("content") or attachment.get("downloadLink")
                 filename = attachment.get("filename", f"attachment_{attachment_id}")
+                is_xray_hosted = attachment.get("_source") == "xray_cloud" or (
+                    isinstance(content_url, str)
+                    and "xray.cloud.getxray.app" in content_url
+                    and "/api/v2/attachments/" in content_url
+                )
                 
                 if not content_url:
                     self.logger.warning(f"Attachment {attachment_id} ({filename}) has no content URL, skipping download")
@@ -362,14 +532,26 @@ class XrayCloudExtractor(BaseExtractor):
                     attachment["download_error"] = "No content URL available"
                     failed_count += 1
                     continue
-                
-                # First check if we can access attachment metadata (helps diagnose permission issues)
-                metadata = self.client.check_attachment_access(attachment_id)
-                if not metadata and self.client.jira_email:
-                    self.logger.debug(f"Could not access attachment metadata for {attachment_id} - may indicate permission issue")
-                
-                # Download the file
-                file_content = self.client.download_attachment(content_url)
+
+                if is_xray_hosted:
+                    file_content = self.client.download_xray_cloud_attachment(content_url)
+                else:
+                    if not self.client.jira_email or not self.client.jira_api_token:
+                        self.logger.warning(
+                            f"Skipping Jira attachment {attachment_id} ({filename}): "
+                            "jira_email + jira_api_token not configured"
+                        )
+                        attachment["downloaded"] = False
+                        attachment["download_error"] = "Jira credentials required"
+                        failed_count += 1
+                        continue
+                    if attachment_id.isdigit():
+                        metadata = self.client.check_attachment_access(attachment_id)
+                        if not metadata and self.client.jira_email:
+                            self.logger.debug(
+                                f"Could not access attachment metadata for {attachment_id} — may indicate permission issue"
+                            )
+                    file_content = self.client.download_attachment(content_url)
                 
                 # Sanitize filename (remove path separators and other problematic characters)
                 safe_filename = filename.replace("/", "_").replace("\\", "_").replace("..", "_")

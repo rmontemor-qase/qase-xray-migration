@@ -487,3 +487,23 @@ class GraphQLClient:
                     logger.error("404 Not Found - Attachment may have been deleted or moved")
             
             raise Exception(error_msg)
+
+    def download_xray_cloud_attachment(self, url: str) -> bytes:
+        """
+        Download a file from Xray Cloud ``/api/v2/attachments/{id}`` (test-run evidence, etc.).
+
+        Uses the same Xray Cloud Bearer token as GraphQL — not Jira Basic Auth.
+        """
+        self._ensure_authenticated()
+        self._check_rate_limit()
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "*/*",
+        }
+        try:
+            response = self.session.get(url, headers=headers, timeout=120)
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            logger.error("Failed to download Xray Cloud attachment from %s: %s", url, e)
+            raise Exception(f"Failed to download Xray Cloud attachment: {e}") from e

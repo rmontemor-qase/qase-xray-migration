@@ -1,5 +1,6 @@
 """Loader for importing transformed data into Qase."""
 
+import copy
 import json
 from typing import Dict, Any, List, Optional
 from pathlib import Path
@@ -9,6 +10,10 @@ from services.qase_service import QaseService
 from utils.cache_manager import CacheManager
 from utils.logger import get_logger
 from models.mappings import MappingStore
+from transformers.xray_transformer import (
+    replace_jira_attachment_refs_in_text,
+    replace_xray_cloud_attachment_urls_in_text,
+)
 
 logger = get_logger(__name__)
 
@@ -94,7 +99,7 @@ class QaseLoader:
             
             if runs:
                 logger.info("Step 6: Creating runs and results...")
-                self._load_runs_and_results(runs, results)
+                self._load_runs_and_results(runs, results, attachments_map or {})
             
             # Save updated mappings
             self._save_mappings()
@@ -294,9 +299,30 @@ class QaseLoader:
                     else:
                         logger.warning(f"Attachment {xray_id} not found in map for case '{case_title}'. Available keys: {list(attachments_map.keys())[:10]}")
                 
-                # Update case with deduplicated attachments
-                if updated_attachments:
-                    case["attachments"] = list(set(updated_attachments))
+                # Jira wiki !file.png|...! and [^file] in description/steps → markdown with Qase CDN URLs
+                inline_hashes: List[str] = []
+                new_desc, hd = replace_jira_attachment_refs_in_text(
+                    case.get("description") or "", attachments_map
+                )
+                new_desc, hx = replace_xray_cloud_attachment_urls_in_text(new_desc, attachments_map)
+                case["description"] = new_desc
+                inline_hashes.extend(hd)
+                inline_hashes.extend(hx)
+                for step in case.get("steps") or []:
+                    if not isinstance(step, dict):
+                        continue
+                    for key in ("action", "expected_result", "data"):
+                        val = step.get(key)
+                        if isinstance(val, str) and val.strip():
+                            nv, hv = replace_jira_attachment_refs_in_text(val, attachments_map)
+                            nv, hx2 = replace_xray_cloud_attachment_urls_in_text(nv, attachments_map)
+                            step[key] = nv
+                            inline_hashes.extend(hv)
+                            inline_hashes.extend(hx2)
+
+                merged = list(dict.fromkeys(updated_attachments + inline_hashes))
+                if merged:
+                    case["attachments"] = merged
                     logger.debug(f"Case '{case_title}' now has {len(case['attachments'])} attachments")
                 else:
                     case["attachments"] = []
@@ -371,27 +397,38 @@ class QaseLoader:
                 try:
                     result = self.qase_service.create_cases_bulk(project_code, clean_batch)
                     
-                    # Update case ID mappings if IDs were preserved
                     created_cases = result.get("cases", [])
+                    created_ids = result.get("ids") or []
+                    created_count = result.get("created_count")
+                    if created_count is None:
+                        created_count = len(created_ids) if created_ids else len(created_cases)
                     
-                    # Even if response doesn't have cases, count them as created
-                    # since the API call succeeded
-                    self.stats["cases"] += len(clean_batch)
+                    if created_count != len(clean_batch):
+                        logger.error(
+                            "Project %s: Qase created %s of %s cases in this batch. "
+                            "Check for duplicate titles in Qase or API limits. "
+                            "Re-transform after fixing titles if needed.",
+                            project_code,
+                            created_count,
+                            len(clean_batch),
+                        )
                     
-                    # Try to map case IDs if we have them in response
-                    if created_cases:
-                        for j, created_case in enumerate(created_cases):
-                            if j < len(batch):
-                                original_case = batch[j]
-                                xray_issue_id = original_case.get("_xray_issue_id")
-                                qase_case_id = created_case.get("id")
-                                
-                                if xray_issue_id and qase_case_id:
-                                    self.mappings.add_mapping(
-                                        xray_id=str(xray_issue_id),
-                                        qase_id=str(qase_case_id),
-                                        entity_type="case"
-                                    )
+                    self.stats["cases"] += created_count
+                    
+                    id_list = created_ids if created_ids else [c.get("id") for c in created_cases]
+                    for j, qase_case_id in enumerate(id_list):
+                        if j >= len(batch):
+                            break
+                        if qase_case_id is None:
+                            continue
+                        original_case = batch[j]
+                        xray_issue_id = original_case.get("_xray_issue_id")
+                        if xray_issue_id:
+                            self.mappings.add_mapping(
+                                xray_id=str(xray_issue_id),
+                                qase_id=str(qase_case_id),
+                                entity_type="case",
+                            )
                     
                 except Exception as e:
                     logger.error(f"Error creating cases batch: {e}")
@@ -400,9 +437,11 @@ class QaseLoader:
     def _load_runs_and_results(
         self,
         runs: List[Dict[str, Any]],
-        results: List[Dict[str, Any]]
+        results: List[Dict[str, Any]],
+        attachments_map: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         """Load runs and results into Qase."""
+        attachments_map = attachments_map or {}
         for run_data in tqdm(runs, desc="Creating runs"):
             try:
                 project_code = run_data.get("_project_code")
@@ -412,7 +451,7 @@ class QaseLoader:
                 # Resolve case IDs from Xray issue IDs
                 case_ids = []
                 for xray_case_id in run_data.get("cases", []):
-                    qase_case_id = self.mappings.get_qase_id(str(xray_case_id))
+                    qase_case_id = self.mappings.get_qase_id(str(xray_case_id), "case")
                     if qase_case_id:
                         case_ids.append(int(qase_case_id))
                 
@@ -420,51 +459,157 @@ class QaseLoader:
                     logger.warning(f"Run {run_data.get('title')} has no valid cases, skipping")
                     continue
                 
-                # Prepare run payload
+                raw_desc = run_data.get("description", "") or ""
+                run_desc, _ = replace_jira_attachment_refs_in_text(
+                    raw_desc, attachments_map
+                )
+                run_desc, _ = replace_xray_cloud_attachment_urls_in_text(
+                    run_desc, attachments_map
+                )
                 run_payload = {
                     "title": run_data.get("title"),
-                    "description": run_data.get("description", ""),
+                    "description": run_desc,
                     "cases": case_ids
                 }
                 
                 result = self.qase_service.create_run(project_code, run_payload)
                 run_id = result.get("id")
+                if run_id is None:
+                    logger.error("Create run returned no id for %r", run_data.get("title"))
+                    self.stats["errors"] += 1
+                    continue
+                run_id = int(run_id)
                 
-                # Find and upload results for this run
-                # Match results by test case ID (results have Xray case ID, need to map to Qase)
+                # Match results to this run: testops_id is Xray test issue id; scope by execution when present
+                run_execution_id = run_data.get("_execution_issue_id")
                 run_results = []
                 for r in results:
+                    rex = r.get("_execution_issue_id")
+                    if (
+                        rex is not None
+                        and run_execution_id is not None
+                        and str(rex) != str(run_execution_id)
+                    ):
+                        continue
                     xray_case_id = str(r.get("testops_id", ""))
-                    qase_case_id = self.mappings.get_qase_id(xray_case_id)
+                    qase_case_id = self.mappings.get_qase_id(xray_case_id, "case")
                     if qase_case_id and int(qase_case_id) in case_ids:
                         run_results.append(r)
+                
+                if not run_results and results:
+                    logger.warning(
+                        "Run %r (id=%s): no results matched %s case id(s) in run — "
+                        "check transformed results use Xray test issue ids as testops_id; re-run transform.",
+                        run_data.get("title"),
+                        run_id,
+                        len(case_ids),
+                    )
                 
                 if run_results:
                     # Update result testops_id with actual Qase case IDs
                     clean_results = []
                     for result_data in run_results:
                         xray_case_id = str(result_data.get("testops_id", ""))
-                        qase_case_id = self.mappings.get_qase_id(xray_case_id)
+                        qase_case_id = self.mappings.get_qase_id(xray_case_id, "case")
                         if qase_case_id:
-                            clean_result = result_data.copy()
+                            working = copy.deepcopy(result_data)
+                            top_xray_att = working.pop("_xray_attachment_ids", None) or []
+                            top_hashes: List[str] = []
+                            for xid in top_xray_att:
+                                ad = attachments_map.get(str(xid))
+                                if ad and ad.get("hash"):
+                                    top_hashes.append(str(ad["hash"]))
+
+                            step_list = working.get("steps")
+                            if isinstance(step_list, list):
+                                for step in step_list:
+                                    if not isinstance(step, dict):
+                                        continue
+                                    s_xray = step.pop("_xray_attachment_ids", None) or []
+                                    sh: List[str] = []
+                                    for xid in s_xray:
+                                        ad = attachments_map.get(str(xid))
+                                        if ad and ad.get("hash"):
+                                            sh.append(str(ad["hash"]))
+                                    ex = step.get("execution") or {}
+                                    if sh:
+                                        ex["attachments"] = list(dict.fromkeys(sh))
+                                    sc = ex.get("comment")
+                                    if isinstance(sc, str) and sc.strip():
+                                        nsc, _ = replace_jira_attachment_refs_in_text(
+                                            sc, attachments_map
+                                        )
+                                        nsc, _ = replace_xray_cloud_attachment_urls_in_text(
+                                            nsc, attachments_map
+                                        )
+                                        ex["comment"] = nsc
+                                    step["execution"] = ex
+
+                            clean_result = {
+                                k: v
+                                for k, v in working.items()
+                                if not str(k).startswith("_")
+                            }
                             clean_result["testops_id"] = int(qase_case_id)
+                            existing_att = clean_result.get("attachments") or []
+                            if not isinstance(existing_att, list):
+                                existing_att = []
+                            clean_result["attachments"] = list(
+                                dict.fromkeys(existing_att + top_hashes)
+                            )
+                            msg = clean_result.get("message")
+                            if isinstance(msg, str) and msg.strip():
+                                nm, hj = replace_jira_attachment_refs_in_text(
+                                    msg, attachments_map
+                                )
+                                nm, hx = replace_xray_cloud_attachment_urls_in_text(
+                                    nm, attachments_map
+                                )
+                                clean_result["message"] = nm
+                                extra = list(dict.fromkeys(hj + hx))
+                                if extra:
+                                    clean_result["attachments"] = list(
+                                        dict.fromkeys(
+                                            (clean_result.get("attachments") or []) + extra
+                                        )
+                                    )
                             clean_results.append(clean_result)
                     
                     if clean_results:
                         # Process in batches of 500
                         batch_size = 500
+                        results_batches_ok = True
                         for i in range(0, len(clean_results), batch_size):
                             batch = clean_results[i:i + batch_size]
                             try:
                                 self.qase_service.create_results_bulk_v2(
                                     project_code,
                                     run_id,
-                                    batch
+                                    batch,
                                 )
                                 self.stats["results"] += len(batch)
                             except Exception as e:
                                 logger.error(f"Error creating results batch: {e}")
                                 self.stats["errors"] += 1
+                                results_batches_ok = False
+                        has_untested = any(
+                            (r.get("execution") or {}).get("status") == "untested"
+                            for r in clean_results
+                        )
+                        if results_batches_ok and not has_untested:
+                            try:
+                                self.qase_service.complete_run(project_code, run_id)
+                            except Exception as e:
+                                logger.warning(
+                                    "Run %s created with results but complete_run failed: %s",
+                                    run_id,
+                                    e,
+                                )
+                        elif results_batches_ok and has_untested:
+                            logger.info(
+                                "Leaving run %s in progress (contains untested / TODO results)",
+                                run_id,
+                            )
                 
                 self.stats["runs"] += 1
                 

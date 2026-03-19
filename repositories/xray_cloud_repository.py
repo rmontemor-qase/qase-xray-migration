@@ -1,6 +1,7 @@
 """Repository for accessing Xray Cloud GraphQL API."""
 
 from typing import List, Dict, Any, Optional
+
 from tqdm import tqdm
 
 from utils.graphql_client import GraphQLClient
@@ -52,13 +53,20 @@ class XrayCloudRepository:
         projects = []
         
         for key in tqdm(project_keys, desc="Fetching projects"):
-            try:
-                # Use Jira REST API to get project details
-                project_data = self.client.get_jira_rest_api(f"/rest/api/3/project/{key}")
-                projects.append(project_data)
-            except Exception as e:
-                logger.error(f"Failed to fetch project {key}: {e}")
-                # Continue with other projects
+            last_err: Optional[Exception] = None
+            for endpoint in (
+                f"/rest/api/3/project/{key}",
+                f"/rest/api/2/project/{key}",
+            ):
+                try:
+                    project_data = self.client.get_jira_rest_api(endpoint)
+                    projects.append(project_data)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+            if last_err is not None:
+                logger.error(f"Failed to fetch project {key}: {last_err}")
         
         logger.info(f"Fetched {len(projects)} projects")
         return projects
@@ -66,7 +74,7 @@ class XrayCloudRepository:
     def get_tests(
         self,
         project_key: str,
-        folder_path: Optional[str] = None
+        folder_path: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Get all tests for a project using GraphQL.
@@ -80,11 +88,10 @@ class XrayCloudRepository:
         """
         logger.info(f"Fetching tests for project {project_key}...")
         
-        all_tests = []
+        all_tests: List[Dict[str, Any]] = []
         start = 0
         limit = self.MAX_LIMIT
         
-        # Build JQL query
         jql = f"project = '{project_key}'"
         if folder_path:
             jql += f" AND folder = '{folder_path}'"
@@ -110,7 +117,7 @@ class XrayCloudRepository:
                 action
                 result
               }
-              jira(fields: ["summary", "description", "labels", "attachment"])
+              jira(fields: ["key", "summary", "description", "labels", "attachment", "project"])
             }
           }
         }
@@ -121,7 +128,7 @@ class XrayCloudRepository:
                 variables = {
                     "jql": jql,
                     "limit": limit,
-                    "start": start
+                    "start": start,
                 }
                 
                 response = self.client.execute_query(query, variables)
@@ -134,28 +141,30 @@ class XrayCloudRepository:
                 
                 all_tests.extend(results)
                 
-                logger.info(f"Page: start={start_pos}, limit={limit_val}, fetched={len(results)}, total_fetched={len(all_tests)}, API_total={total}")
-                logger.debug(f"Fetched {len(results)} tests (total fetched: {len(all_tests)}, API total: {total})")
+                logger.info(
+                    f"Page: start={start_pos}, limit={limit_val}, fetched={len(results)}, "
+                    f"total_fetched={len(all_tests)}, API_total={total}"
+                )
+                logger.debug(
+                    f"Fetched {len(results)} tests (total fetched: {len(all_tests)}, API total: {total})"
+                )
                 
-                # Check if we've fetched all tests
-                # If we got fewer results than requested, we're done (last page)
                 if len(results) < limit:
-                    logger.debug(f"Got fewer results ({len(results)}) than limit ({limit}), pagination complete")
+                    logger.debug(
+                        f"Got fewer results ({len(results)}) than limit ({limit}), pagination complete"
+                    )
                     break
                 
-                # If we've fetched at least as many as the API says exist, we're done
                 if total > 0 and len(all_tests) >= total:
                     logger.debug(f"Fetched all {total} tests according to API")
                     break
                 
-                # If no more results, we're done
                 if len(results) == 0:
                     logger.debug("No more results, pagination complete")
                     break
                 
                 start += limit
                 
-                # Safety check to prevent infinite loops
                 if start >= self.MAX_TOTAL:
                     logger.warning(f"Reached maximum limit of {self.MAX_TOTAL} tests")
                     break
@@ -209,16 +218,41 @@ class XrayCloudRepository:
                     issueId
                   }
                   comment
+                  defects
+                  evidence {
+                    id
+                    filename
+                    downloadLink
+                    storedInJira
+                    createdOn
+                  }
                   steps {
+                    id
                     status {
                       name
                     }
+                    action
+                    data
+                    result
                     actualResult
                     comment
+                    defects
+                    evidence {
+                      id
+                      filename
+                      downloadLink
+                      storedInJira
+                    }
+                    attachments {
+                      id
+                      filename
+                      downloadLink
+                      storedInJira
+                    }
                   }
                 }
               }
-              jira(fields: ["summary", "description"])
+              jira(fields: ["summary", "description", "project"])
             }
           }
         }

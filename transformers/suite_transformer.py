@@ -32,18 +32,27 @@ class SuiteTransformer(BaseTransformer):
         
         # Create project_id → project_code mapping
         project_id_to_code = {}
+        existing_project_codes = sorted(
+            {
+                m.qase_id
+                for m in self.mappings.mappings.values()
+                if m.entity_type == "project" and m.qase_id
+            }
+        )
         for project in projects_data:
-            project_id = str(project.get("id", ""))
-            project_name = project.get("name", project.get("key", "Unknown"))
-            project_code = self.mappings.get_qase_id(project_id)
+            pj_key = project.get("key", "") or ""
+            project_id = str(project.get("id", pj_key))
+            project_name = project.get("name", pj_key or "Unknown")
+            project_code = self.mappings.get_qase_id(project_id, "project")
             if not project_code:
-                # Generate code if not mapped yet
-                project_code = self.generate_project_code(project_name, [])
+                # Generate code if not mapped yet (same path as cases must share this mapping)
+                project_code = self.generate_project_code(project_name, list(existing_project_codes))
                 self.mappings.add_mapping(
                     xray_id=project_id,
                     qase_id=project_code,
-                    entity_type="project"
+                    entity_type="project",
                 )
+                existing_project_codes.append(project_code)
             project_id_to_code[project_id] = project_code
         
         # Group folders by project

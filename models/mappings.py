@@ -19,18 +19,42 @@ class MappingStore:
     mappings: Dict[str, IDMapping] = field(default_factory=dict)
     
     def add_mapping(self, xray_id: str, qase_id: Optional[str], entity_type: str, metadata: Optional[Dict] = None):
-        """Add or update a mapping."""
-        self.mappings[xray_id] = IDMapping(
-            xray_id=xray_id,
+        """
+        Add or update a mapping.
+
+        Jira numeric IDs can collide across entity kinds (e.g. project id vs issue id). If the storage key
+        is already used by another entity_type, the new entry is stored under ``{entity_type}:{xray_id}``.
+        """
+        key = str(xray_id)
+        existing = self.mappings.get(key)
+        if existing is not None and existing.entity_type != entity_type:
+            key = f"{entity_type}:{key}"
+        self.mappings[key] = IDMapping(
+            xray_id=key,
             qase_id=qase_id,
             entity_type=entity_type,
             metadata=metadata or {}
         )
     
-    def get_qase_id(self, xray_id: str) -> Optional[str]:
-        """Get Qase ID for a given Xray ID."""
-        mapping = self.mappings.get(xray_id)
-        return mapping.qase_id if mapping else None
+    def get_qase_id(self, xray_id: str, entity_type: Optional[str] = None) -> Optional[str]:
+        """
+        Get Qase ID for a given Xray ID.
+
+        When ``entity_type`` is set, only a mapping of that type is returned (avoids project vs case
+        collisions on the same numeric id). Also checks the namespaced key ``{entity_type}:{id}``.
+        """
+        sid = str(xray_id)
+        if entity_type is None:
+            mapping = self.mappings.get(sid)
+            return mapping.qase_id if mapping else None
+        m = self.mappings.get(sid)
+        if m is not None and m.entity_type == entity_type:
+            return m.qase_id
+        alt = f"{entity_type}:{sid}"
+        m = self.mappings.get(alt)
+        if m is not None and m.entity_type == entity_type:
+            return m.qase_id
+        return None
     
     def get_mapping(self, xray_id: str) -> Optional[IDMapping]:
         """Get full mapping for a given Xray ID."""

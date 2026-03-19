@@ -4,9 +4,89 @@ Python CLI that pulls test data from **Xray Cloud** (GraphQL), maps it to **Qase
 
 Phases:
 
-1. **Extract** — Xray projects, folders, test cases, test executions, test runs, and attachments (with optional file download).
+1. **Extract** — Xray projects, folders, test cases, test executions (including nested test runs), and attachments (Jira-hosted and Xray Cloud evidence files, with optional download).
 2. **Transform** — Qase-oriented JSON under `transformed/` (projects, suites, cases, attachment map, runs, results) plus ID mappings.
-3. **Load** — Creates entities in Qase in dependency order (projects → attachments → suite/case updates → suites → cases → runs/results).
+3. **Load** — Creates entities in Qase in dependency order (projects → attachments → case attachment hash updates → suites → cases → runs/results).
+
+## What we migrate from Xray
+
+Scope is **Xray Cloud** via GraphQL plus **Jira Cloud** REST where noted. The tables below reflect what the current code actually maps or imports.
+
+### Projects
+
+| Source | Qase |
+| --- | --- |
+| Jira project name, key, id | Project **title**, **code** (usually Jira key when valid), short **description** noting Xray origin |
+| — | **runs.auto_complete** disabled on created projects |
+
+### Folders → suites
+
+| Source | Qase |
+| --- | --- |
+| Xray folder **path** on tests | **Suites**; suite **description** embeds the Xray path so cases can match the right suite |
+
+### Test cases (tests)
+
+| Source | Qase |
+| --- | --- |
+| Jira **summary** | Case **title** (duplicate titles disambiguated with issue key) |
+| Jira **description** (ADF, string, or HTML-ish) | Case **description** (Markdown where conversion applies) |
+| Jira **labels** | **Tags** |
+| Xray **steps** (`action`, `result`, `data`) | Case **steps** |
+| Xray **test type** name | **Automation** flag (heuristic) |
+| Xray **folder** path | **Suite** after suites are created |
+| Jira **attachments**; wiki `!file!` / `[^file]` | Upload to Qase; links rewritten to **Qase CDN URLs** on load |
+
+**Not mapped from Xray/Jira (fixed Qase defaults today):** `preconditions`, `postconditions`, `severity`, `priority`, `type`, `behavior`, `status`.
+
+### Attachments (files)
+
+| Source | Behavior |
+| --- | --- |
+| Jira issue attachments | **Jira email + API token**; uploaded to Qase; map keyed by Jira attachment id |
+| Xray Cloud test-run **evidence** / step **evidence** & **attachments** (`/api/v2/attachments/{uuid}`) | **Xray client id/secret** (Bearer); same upload path; Xray URLs in text replaced with **Qase URLs** on load |
+
+### Test executions → runs
+
+| Source | Qase |
+| --- | --- |
+| Execution Jira **summary** / **description** | Run **title** / **description** |
+| Tests referenced by nested **test runs** | Run **cases** (resolved to Qase case ids on load) |
+
+### Test runs → results
+
+| Source | Qase |
+| --- | --- |
+| Run **status** | Result **status** (passed / failed / blocked / skipped / **untested** for TODO-style states) |
+| Started/finished | **duration** (result wall-clock times omitted for Qase API rules) |
+| **comment**, **defects**, **evidence** | **message** (structured Markdown sections) + result **attachments** |
+| Step **action** / **result** | Step definition: **action** / **expected_result** |
+| Step **actualResult**, **comment**, **defects**, **evidence**, **attachments** | Step **comment** (Markdown) + step **attachments** (hashes) |
+
+Runs that include **untested** results are left **in progress** (complete run is not called for those).
+
+### ID mappings
+
+`mappings/id_mappings.json` stores Xray/Jira → Qase ids (e.g. projects, cases) for load and traceability.
+
+---
+
+## What we do **not** migrate yet
+
+- **Test plans**, **test sets**, **boards**, **requirements** / coverage reporting.
+- **Cucumber/Gherkin** as structured scenarios (only a coarse automation hint from test type).
+- **Test versions**, **parameters**, **iterations**, **datasets** on runs.
+- **Custom fields** on tests, executions, or run steps.
+- **Precondition** issues and precondition **results** (not fully queried/mapped).
+- **Assignee** / **executed by** → Qase users.
+- **Jira priority, components, epics, fix versions** → Qase case fields.
+- **Defects** as first-class Qase defects or guaranteed Jira **keys** (often ids only from GraphQL).
+- **Exact historical** result start/end times in Qase (duration preserved where possible).
+- **Xray Server / Data Center** (Cloud only).
+- GraphQL **pagination** limits (very large projects; `testRuns(limit: 100)` per execution in the current query may truncate heavy executions).
+- **Qase** shared steps, custom fields on entities, and external integrations driven from Xray.
+
+---
 
 ## Prerequisites
 
@@ -43,9 +123,9 @@ cp config.json.example config.json
 | `jira_url` | Jira Cloud base URL (e.g. `https://yourcompany.atlassian.net`) |
 | `projects` | List of Jira project keys to migrate (e.g. `["PROJ1", "PROJ2"]`) |
 
-### Jira — attachment downloads (recommended)
+### Jira — attachment downloads (recommended for Jira-hosted files)
 
-Attachment binaries are fetched from Jira; without credentials, attachment download may be skipped while GraphQL metadata can still be stored.
+Jira issue attachments are downloaded with **Jira** credentials. **Xray Cloud** test-run evidence files use **Xray** client id/secret only. Without Jira credentials, Jira-hosted binaries may be skipped while metadata is still stored.
 
 | Field | Description |
 | --- | --- |
@@ -133,10 +213,9 @@ cache/
     │   ├── projects.json
     │   ├── folders.json
     │   ├── test_cases.json
-    │   ├── test_executions.json
-    │   ├── test_runs.json
+    │   ├── test_executions.json   # includes nested test runs per execution
     │   └── attachments.json
-    ├── attachments/              # Downloaded files (when Jira auth works)
+    ├── attachments/              # Downloaded files (Jira and/or Xray Cloud evidence)
     ├── transformed/              # After transform
     │   ├── projects.json
     │   ├── suites.json
@@ -161,8 +240,9 @@ cache/
 
 ### Attachment download (401 / 403)
 
-- **401:** Add valid `jira_email` + `jira_api_token`, or configure OAuth fields if that is your intended path.
-- **403:** Issue or project permissions, or attachment restrictions in Jira. Confirm access in the Jira UI; extraction can still persist metadata without files.
+- **Jira issue attachments — 401:** Add valid `jira_email` + `jira_api_token` (or OAuth if that is your path).
+- **Jira — 403:** Project/issue permissions or attachment restrictions; confirm in the Jira UI. Metadata may still be saved without files.
+- **Xray Cloud evidence** (`getxray.app/.../attachments/...`): Uses **Xray** `client_id` / `client_secret` only. If downloads fail, check Xray API access and `extraction_errors.log`.
 
 ### Rate limits
 

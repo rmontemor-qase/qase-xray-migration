@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List, Tuple
+import os
 import re
 import json
 from pathlib import Path
@@ -11,6 +12,172 @@ from utils.logger import get_logger
 from models.mappings import MappingStore
 
 logger = get_logger(__name__)
+
+_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp")
+
+
+def replace_jira_attachment_refs_in_text(
+    text: str,
+    attachment_map: Optional[Dict[str, Dict[str, Any]]],
+) -> Tuple[str, List[str]]:
+    """
+    Replace Jira-style attachment references in plain text / markdown with Qase-friendly links.
+
+    Supported:
+    - Wiki images: ``!file.png!`` or ``!file.png|width=200,alt="label"!`` (common in Jira text/export).
+    - Storage refs: ``[^file.png]`` (some Confluence/Jira exports).
+
+    Matching uses ``attachment_map`` values' ``filename`` (case-insensitive, basename match).
+    Replaces with ``![alt](url)`` or ``[name](url)`` using the **Qase upload URL** (e.g. CDN) once
+    ``url`` is set on the map entry; until then the original token is left unchanged.
+
+    Returns (new_text, list of attachment hashes referenced — for linking on the case).
+    """
+    if not text or not attachment_map:
+        return text or "", []
+
+    hashes_out: List[str] = []
+
+    def find_by_filename(name: str) -> Optional[Dict[str, Any]]:
+        name = (name or "").strip()
+        if not name:
+            return None
+        want_bn = os.path.basename(name).lower()
+        for _aid, att in attachment_map.items():
+            if not isinstance(att, dict):
+                continue
+            fn = (att.get("filename") or "").strip()
+            if not fn:
+                continue
+            if fn == name or fn.lower() == name.lower():
+                return att
+            if os.path.basename(fn).lower() == want_bn:
+                return att
+        return None
+
+    def to_markdown(filename: str, link_label: str) -> Optional[str]:
+        att = find_by_filename(filename)
+        if not att:
+            return None
+        url = att.get("url")
+        if not url:
+            return None
+        h = att.get("hash")
+        if h:
+            hashes_out.append(str(h))
+        label = (link_label or filename or "file").strip() or filename
+        lower = filename.lower()
+        is_img = any(lower.endswith(ext) for ext in _IMG_EXT)
+        if is_img:
+            return f"![{label}]({url})"
+        return f"[{label}]({url})"
+
+    def repl_wiki(m: re.Match) -> str:
+        inner = (m.group(1) or "").strip()
+        if "|" in inner:
+            fname, opts = inner.split("|", 1)
+        else:
+            fname, opts = inner, ""
+        fname = fname.strip()
+        if not fname:
+            return m.group(0)
+        alt = fname
+        am = re.search(r'alt\s*=\s*"([^"]*)"', opts) or re.search(
+            r"alt\s*=\s*'([^']*)'", opts
+        )
+        if am:
+            alt = am.group(1).strip() or alt
+        md = to_markdown(fname, alt)
+        return md if md is not None else m.group(0)
+
+    def repl_bracket(m: re.Match) -> str:
+        filename = (m.group(1) or "").strip()
+        if not filename:
+            return m.group(0)
+        md = to_markdown(filename, filename)
+        return md if md is not None else m.group(0)
+
+    out = re.sub(r"!([^!\n]+?)!", repl_wiki, text)
+    out = re.sub(r"\[\^([^\]]+)\]", repl_bracket, out)
+    return out, list(dict.fromkeys(hashes_out))
+
+
+# Xray Cloud evidence URLs (us/eu host) → replaced with Qase CDN links after upload
+_XRAY_ATT_UUID = (
+    r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
+)
+_RE_MD_XRAY_LINK = re.compile(
+    rf"\[([^\]]*)\]\(\s*(https://[a-zA-Z0-9.-]*xray\.cloud\.getxray\.app/api/v2/attachments/({_XRAY_ATT_UUID}))\s*\)",
+    re.IGNORECASE,
+)
+_RE_BARE_XRAY_ATT_URL = re.compile(
+    rf"https://[a-zA-Z0-9.-]*xray\.cloud\.getxray\.app/api/v2/attachments/({_XRAY_ATT_UUID})",
+    re.IGNORECASE,
+)
+
+
+def replace_xray_cloud_attachment_urls_in_text(
+    text: str,
+    attachment_map: Optional[Dict[str, Dict[str, Any]]],
+) -> Tuple[str, List[str]]:
+    """
+    Replace markdown links (or bare URLs) pointing at Xray Cloud ``/api/v2/attachments/{uuid}``
+    with Qase ``url`` from ``attachment_map`` (key = attachment uuid string), and collect hashes.
+    """
+    if not text or not attachment_map:
+        return text or "", []
+
+    hashes_out: List[str] = []
+
+    def _att_for_uuid(uid: str) -> Optional[Dict[str, Any]]:
+        uid = (uid or "").strip()
+        if not uid:
+            return None
+        att = attachment_map.get(uid)
+        if att:
+            return att
+        uid_l = uid.lower()
+        for k, v in attachment_map.items():
+            if str(k).strip().lower() == uid_l:
+                return v if isinstance(v, dict) else None
+        return None
+
+    def _to_md(att: Dict[str, Any], link_label: str) -> Optional[str]:
+        url = att.get("url")
+        if not url:
+            return None
+        h = att.get("hash")
+        if h:
+            hashes_out.append(str(h))
+        fn = (att.get("filename") or "file").strip() or "file"
+        label = (link_label or "").strip() or fn
+        lower = fn.lower()
+        is_img = any(lower.endswith(ext) for ext in _IMG_EXT)
+        if is_img:
+            return f"![{label}]({url})"
+        return f"[{label}]({url})"
+
+    def repl_md_link(m: re.Match) -> str:
+        label, _full, uid = m.group(1), m.group(2), m.group(3)
+        att = _att_for_uuid(uid)
+        if not att:
+            return m.group(0)
+        md = _to_md(att, label)
+        return md if md is not None else m.group(0)
+
+    out = _RE_MD_XRAY_LINK.sub(repl_md_link, text)
+
+    def repl_bare(m: re.Match) -> str:
+        uid = m.group(1)
+        att = _att_for_uuid(uid)
+        if not att:
+            return m.group(0)
+        fn = (att.get("filename") or "file").strip() or "file"
+        md = _to_md(att, fn)
+        return md if md is not None else m.group(0)
+
+    out = _RE_BARE_XRAY_ATT_URL.sub(repl_bare, out)
+    return out, list(dict.fromkeys(hashes_out))
 
 
 class BaseTransformer(ABC):
@@ -38,95 +205,237 @@ class BaseTransformer(ABC):
         """
         pass
     
-    def convert_jira_doc_to_markdown(self, doc: Dict[str, Any]) -> str:
+    def convert_jira_doc_to_markdown(self, doc: Any) -> str:
         """
-        Convert Jira document format (Atlassian Document Format) to Markdown.
-        
-        Args:
-            doc: Jira document object with type, version, content
-        
-        Returns:
-            Markdown string
+        Convert Jira issue text to Markdown for Qase.
+
+        Handles:
+        - **Plain strings** (some APIs return description as text/HTML/wiki) — returned trimmed.
+        - **ADF** (Atlassian Document Format) ``{"type": "doc", "content": [...]}`` — converted
+          with correct **inline** joining (adjacent text runs are concatenated, not split by newlines).
+
+        Older code only accepted dict ADF and joined all nodes with ``\\n``, which broke paragraphs
+        and dropped string descriptions entirely.
         """
-        if not doc or not isinstance(doc, dict):
+        if doc is None:
             return ""
-        
-        content = doc.get("content", [])
-        if not content:
+        if isinstance(doc, str):
+            s = doc.strip()
+            if len(s) > 1 and s[0] == "{" and s.endswith("}"):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, dict):
+                        return self.convert_jira_doc_to_markdown(parsed)
+                except json.JSONDecodeError:
+                    pass
+            return self._strip_simple_html_if_needed(s)
+        if not isinstance(doc, dict):
+            return str(doc).strip() if doc else ""
+
+        # ADF root or any dict that carries block content
+        content = doc.get("content")
+        if isinstance(content, list) and content:
+            return self._adf_blocks_to_markdown(content)
+        # Empty ADF shell
+        if doc.get("type") == "doc" or "content" in doc:
             return ""
-        
-        return self._process_content_nodes(content)
-    
-    def _process_content_nodes(self, nodes: List[Dict[str, Any]]) -> str:
-        """Process content nodes recursively."""
-        result = []
-        
+        # Single stray block node (unlikely)
+        if doc.get("type"):
+            return self._adf_blocks_to_markdown([doc])
+        return ""
+
+    def _strip_simple_html_if_needed(self, s: str) -> str:
+        """Best-effort cleanup when Jira returns a string description with HTML tags."""
+        if not s or "<" not in s:
+            return s
+        # Minimal unescape + tag strip (avoid adding heavy deps)
+        out = re.sub(r"<br\s*/?>", "\n", s, flags=re.IGNORECASE)
+        out = re.sub(r"</p\s*>", "\n\n", out, flags=re.IGNORECASE)
+        out = re.sub(r"<[^>]+>", "", out)
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        return out.strip()
+
+    def _apply_adf_marks(self, text: str, marks: List[Dict[str, Any]]) -> str:
+        formatted = text or ""
+        for mark in marks or []:
+            mark_type = mark.get("type", "")
+            attrs = mark.get("attrs") or {}
+            if mark_type == "strong":
+                formatted = f"**{formatted}**"
+            elif mark_type == "em":
+                formatted = f"*{formatted}*"
+            elif mark_type == "code":
+                formatted = f"`{formatted}`"
+            elif mark_type == "link":
+                href = attrs.get("href", "")
+                formatted = f"[{formatted}]({href})"
+            elif mark_type == "strike":
+                formatted = f"~~{formatted}~~"
+            elif mark_type == "underline":
+                # Markdown has no standard underline; keep readable
+                formatted = formatted
+        return formatted
+
+    def _adf_collect_plain_text(self, nodes: List[Dict[str, Any]]) -> str:
+        """Deep collect text from unknown nodes (fallback)."""
+        parts: List[str] = []
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            if node.get("type") == "text":
+                parts.append(self._apply_adf_marks(node.get("text", ""), node.get("marks", [])))
+            elif node.get("content"):
+                parts.append(self._adf_collect_plain_text(node["content"]))
+        return "".join(parts)
+
+    def _adf_inline(self, nodes: List[Dict[str, Any]]) -> str:
+        """Render inline / phrasing ADF nodes into one line (newlines only from hardBreak)."""
+        if not nodes:
+            return ""
+        parts: List[str] = []
         for node in nodes:
+            if not isinstance(node, dict):
+                continue
             node_type = node.get("type", "")
             content = node.get("content", [])
-            text = node.get("text", "")
-            marks = node.get("marks", [])
-            
-            # Apply marks (bold, italic, code, etc.)
-            formatted_text = text
-            for mark in marks:
-                mark_type = mark.get("type", "")
-                if mark_type == "strong":
-                    formatted_text = f"**{formatted_text}**"
-                elif mark_type == "em":
-                    formatted_text = f"*{formatted_text}*"
-                elif mark_type == "code":
-                    formatted_text = f"`{formatted_text}`"
-                elif mark_type == "link":
-                    href = mark.get("attrs", {}).get("href", "")
-                    formatted_text = f"[{formatted_text}]({href})"
-            
-            if node_type == "paragraph":
-                para_text = formatted_text + self._process_content_nodes(content)
-                if para_text.strip():
-                    result.append(para_text)
-            elif node_type == "heading":
-                level = node.get("attrs", {}).get("level", 1)
-                heading_text = formatted_text + self._process_content_nodes(content)
-                if heading_text.strip():
-                    result.append(f"{'#' * level} {heading_text}")
-            elif node_type == "bulletList":
-                list_items = self._process_content_nodes(content)
-                result.append(list_items)
-            elif node_type == "orderedList":
-                list_items = self._process_content_nodes(content)
-                result.append(list_items)
-            elif node_type == "listItem":
-                item_text = formatted_text + self._process_content_nodes(content)
-                if item_text.strip():
-                    result.append(f"- {item_text}")
-            elif node_type == "codeBlock":
-                code = node.get("content", [{}])[0].get("text", "") if node.get("content") else ""
-                language = node.get("attrs", {}).get("language", "")
-                result.append(f"```{language}\n{code}\n```")
+            if node_type == "text":
+                parts.append(
+                    self._apply_adf_marks(node.get("text", ""), node.get("marks", []))
+                )
             elif node_type == "hardBreak":
-                result.append("\n")
-            elif node_type == "media":
-                # Handle media nodes (images, videos, etc.)
-                attrs = node.get("attrs", {})
-                media_type = attrs.get("type", "")
+                parts.append("\n")
+            elif node_type == "mention":
+                attrs = node.get("attrs", {}) or {}
+                label = attrs.get("text") or attrs.get("id") or "mention"
+                parts.append(f"@{label}")
+            elif node_type == "emoji":
+                attrs = node.get("attrs", {}) or {}
+                short = attrs.get("shortName", "") or attrs.get("text", "")
+                parts.append(short or ":emoji:")
+            elif node_type == "date":
+                attrs = node.get("attrs", {}) or {}
+                parts.append(str(attrs.get("timestamp", attrs.get("date", ""))) or "")
+            elif node_type == "status":
+                attrs = node.get("attrs", {}) or {}
+                parts.append(str(attrs.get("text", attrs.get("color", "status"))))
+            elif node_type in ("inlineCard", "blockCard"):
+                attrs = node.get("attrs", {}) or {}
                 url = attrs.get("url", "")
-                alt = attrs.get("alt", "")
-                
-                if media_type == "file" or url:
-                    if alt:
-                        result.append(f"![{alt}]({url})")
-                    else:
-                        result.append(f"![]({url})")
-            elif node_type == "text":
-                if formatted_text:
-                    result.append(formatted_text)
-            else:
-                # For unknown types, process content recursively
-                if content:
-                    result.append(self._process_content_nodes(content))
-        
-        return "\n".join(result)
+                parts.append(url or "[card]")
+            elif content:
+                parts.append(self._adf_inline(content))
+        return "".join(parts)
+
+    def _adf_code_block_body(self, node: Dict[str, Any]) -> str:
+        """Extract all text from a codeBlock node."""
+        return self._adf_collect_plain_text(node.get("content", []))
+
+    def _adf_list_item_body(self, list_item: Dict[str, Any]) -> str:
+        inner = list_item.get("content", [])
+        chunks: List[str] = []
+        for block in inner:
+            if not isinstance(block, dict):
+                continue
+            rendered = self._adf_block_to_markdown(block)
+            if rendered.strip():
+                chunks.append(rendered.strip())
+        return "\n".join(chunks)
+
+    def _adf_block_to_markdown(self, node: Dict[str, Any]) -> str:
+        if not isinstance(node, dict):
+            return ""
+        node_type = node.get("type", "")
+        content = node.get("content", [])
+
+        if node_type == "paragraph":
+            return self._adf_inline(content).strip()
+        if node_type == "heading":
+            level = int((node.get("attrs") or {}).get("level", 1) or 1)
+            level = max(1, min(6, level))
+            inner = self._adf_inline(content).strip()
+            return f"{'#' * level} {inner}" if inner else ""
+        if node_type == "blockquote":
+            body = self._adf_blocks_to_markdown(content)
+            if not body.strip():
+                return ""
+            return "\n".join(f"> {line}" for line in body.split("\n"))
+        if node_type == "codeBlock":
+            lang = (node.get("attrs") or {}).get("language", "") or ""
+            code = self._adf_code_block_body(node)
+            return f"```{lang}\n{code}\n```"
+        if node_type == "rule":
+            return "---"
+        if node_type == "bulletList":
+            lines: List[str] = []
+            for child in content:
+                if not isinstance(child, dict):
+                    continue
+                if child.get("type") == "listItem":
+                    body = self._adf_list_item_body(child)
+                    for i, ln in enumerate(body.split("\n")):
+                        prefix = "- " if i == 0 else "  "
+                        lines.append(f"{prefix}{ln}")
+            return "\n".join(lines)
+        if node_type == "orderedList":
+            lines = []
+            start = int((node.get("attrs") or {}).get("order", 1) or 1)
+            idx = start
+            for child in content:
+                if not isinstance(child, dict):
+                    continue
+                if child.get("type") == "listItem":
+                    body = self._adf_list_item_body(child)
+                    for i, ln in enumerate(body.split("\n")):
+                        prefix = f"{idx}. " if i == 0 else "   "
+                        lines.append(f"{prefix}{ln}")
+                    idx += 1
+            return "\n".join(lines)
+        if node_type == "listItem":
+            # Top-level orphan list item
+            return "- " + self._adf_list_item_body(node)
+        if node_type in ("mediaSingle", "mediaGroup", "expand", "panel", "nestedExpand"):
+            return self._adf_blocks_to_markdown(content)
+        if node_type == "media":
+            attrs = node.get("attrs", {}) or {}
+            url = attrs.get("url", "")
+            alt = attrs.get("alt", "") or attrs.get("text", "")
+            if url:
+                return f"![{alt}]({url})" if alt else f"![]({url})"
+            att_id = attrs.get("id", "")
+            return f"[attachment:{att_id}]" if att_id else ""
+        if node_type == "table":
+            # Minimal table: rows as markdown lines (no full pipe table alignment)
+            return self._adf_table_to_markdown(node)
+        if node_type in ("doc",):
+            return self._adf_blocks_to_markdown(content)
+        if content:
+            return self._adf_blocks_to_markdown(content)
+        return ""
+
+    def _adf_table_to_markdown(self, table: Dict[str, Any]) -> str:
+        rows_out: List[str] = []
+        for row in table.get("content", []) or []:
+            if not isinstance(row, dict) or row.get("type") != "tableRow":
+                continue
+            cells: List[str] = []
+            for cell in row.get("content", []) or []:
+                if not isinstance(cell, dict):
+                    continue
+                text = self._adf_blocks_to_markdown(cell.get("content", []))
+                cells.append(text.replace("\n", " ").strip())
+            if cells:
+                rows_out.append("| " + " | ".join(cells) + " |")
+        return "\n".join(rows_out)
+
+    def _adf_blocks_to_markdown(self, nodes: List[Dict[str, Any]]) -> str:
+        parts: List[str] = []
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            block = self._adf_block_to_markdown(node)
+            if block.strip():
+                parts.append(block.strip())
+        return "\n\n".join(parts)
     
     def extract_attachment_ids_from_text(self, text: str) -> List[str]:
         """
@@ -146,59 +455,21 @@ class BaseTransformer(ABC):
         # For now, we'll look for common patterns
         attachment_ids = []
         
-        # Pattern: [^filename.ext] - Jira attachment reference
-        pattern = r'\[\^([^\]]+)\]'
-        matches = re.findall(pattern, text)
-        attachment_ids.extend(matches)
-        
+        pattern = r"\[\^([^\]]+)\]"
+        attachment_ids.extend(re.findall(pattern, text))
+        for inner in re.findall(r"!([^!\n]+?)!", text):
+            fname = inner.split("|", 1)[0].strip()
+            if fname:
+                attachment_ids.append(fname)
         return attachment_ids
     
     def replace_attachment_references(
         self,
         text: str,
-        attachment_map: Dict[str, Dict[str, str]]
+        attachment_map: Dict[str, Dict[str, str]],
     ) -> Tuple[str, List[str]]:
-        """
-        Replace attachment references in text with Qase markdown links.
-        
-        Args:
-            text: Text containing attachment references
-            attachment_map: Map of Xray attachment ID → Qase attachment object
-        
-        Returns:
-            Tuple of (processed_text, list_of_attachment_hashes)
-        """
-        if not text:
-            return "", []
-        
-        processed_text = text
-        attachment_hashes = []
-        
-        # Find all attachment references and replace them
-        # This is a simplified version - may need to be enhanced based on actual Xray format
-        # For now, we'll handle common patterns
-        
-        # Pattern: [^filename.ext] - replace with markdown image/link
-        def replace_attachment(match):
-            filename = match.group(1)
-            # Try to find attachment by filename in map
-            for att_id, att_data in attachment_map.items():
-                if att_data.get("filename") == filename:
-                    hash_val = att_data.get("hash")
-                    url = att_data.get("url")
-                    if hash_val and url:
-                        attachment_hashes.append(hash_val)
-                        # Determine if it's an image based on extension
-                        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg')):
-                            return f"![{filename}]({url})"
-                        else:
-                            return f"[{filename}]({url})"
-            return match.group(0)  # Keep original if not found
-        
-        pattern = r'\[\^([^\]]+)\]'
-        processed_text = re.sub(pattern, replace_attachment, processed_text)
-        
-        return processed_text, list(set(attachment_hashes))  # Remove duplicates
+        """Delegate to :func:`replace_jira_attachment_refs_in_text`."""
+        return replace_jira_attachment_refs_in_text(text, attachment_map)
     
     def generate_project_code(self, project_name: str, existing_codes: List[str]) -> str:
         """

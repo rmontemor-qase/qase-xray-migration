@@ -1,6 +1,7 @@
 """Transformer for Xray test cases to Qase cases."""
 
-from typing import Dict, Any, List, Optional
+from collections import Counter
+from typing import Dict, Any, List, Optional, Set, Tuple
 from utils.cache_manager import CacheManager
 from utils.logger import get_logger
 from models.mappings import MappingStore
@@ -11,6 +12,27 @@ logger = get_logger(__name__)
 
 class CaseTransformer(BaseTransformer):
     """Transforms Xray test cases to Qase cases."""
+    
+    def _project_code_for_case(self, test_case: Dict[str, Any]) -> Optional[str]:
+        """Resolve Qase project code from Xray test (projectId and/or embedded jira.project)."""
+        pid = test_case.get("projectId")
+        if pid is not None and str(pid).strip() != "":
+            code = self.mappings.get_qase_id(str(pid), "project")
+            if code:
+                return code
+        jp = (test_case.get("jira") or {}).get("project")
+        if isinstance(jp, dict):
+            jid = jp.get("id")
+            if jid is not None and str(jid).strip() != "":
+                code = self.mappings.get_qase_id(str(jid), "project")
+                if code:
+                    return code
+            jk = jp.get("key")
+            if jk:
+                code = self.mappings.get_qase_id(str(jk).strip().upper(), "project")
+                if code:
+                    return code
+        return None
     
     def transform(
         self,
@@ -29,6 +51,23 @@ class CaseTransformer(BaseTransformer):
         Returns:
             Dictionary mapping project_code → list of case payloads
         """
+        pair_counts: Counter = Counter()
+        for tc in test_cases_data:
+            pc = self._project_code_for_case(tc)
+            if not pc:
+                continue
+            j = tc.get("jira") or {}
+            raw_summary = (j.get("summary") or "").strip()
+            pair_counts[(pc, raw_summary)] += 1
+        duplicate_title_pairs: Set[Tuple[str, str]] = {
+            k for k, c in pair_counts.items() if c > 1
+        }
+        if duplicate_title_pairs:
+            self.logger.info(
+                "Disambiguating %s duplicate (project, title) pair(s) for Qase import",
+                len(duplicate_title_pairs),
+            )
+        
         # Group cases by project
         project_cases: Dict[str, List[Dict[str, Any]]] = {}
         
@@ -36,14 +75,13 @@ class CaseTransformer(BaseTransformer):
             try:
                 project_id = str(test_case.get("projectId", ""))
                 
-                # Get project code from mapping
-                project_code = self.mappings.get_qase_id(project_id)
+                project_code = self._project_code_for_case(test_case)
                 if not project_code:
-                    # Debug: Check what mappings are available
-                    available_ids = list(self.mappings.mappings.keys())
+                    available = list(self.mappings.mappings.keys())
                     self.logger.warning(
-                        f"Project {project_id} not found in mappings. "
-                        f"Available mappings: {available_ids}. Skipping case."
+                        f"No project mapping for test issue {test_case.get('issueId')} "
+                        f"(projectId={project_id!r}). "
+                        f"Mapping keys (sample): {available[:20]}{'...' if len(available) > 20 else ''}. Skipping case."
                     )
                     continue
                 
@@ -54,7 +92,9 @@ class CaseTransformer(BaseTransformer):
                 qase_case = self._transform_single_case(
                     test_case,
                     qase_suites.get(project_code, []),
-                    attachments_map
+                    attachments_map,
+                    project_code,
+                    duplicate_title_pairs,
                 )
                 
                 if qase_case:
@@ -73,7 +113,9 @@ class CaseTransformer(BaseTransformer):
         self,
         test_case: Dict[str, Any],
         suites: List[Dict[str, Any]],
-        attachments_map: Dict[str, Dict[str, str]]
+        attachments_map: Dict[str, Dict[str, str]],
+        project_code: str,
+        duplicate_title_pairs: Set[Tuple[str, str]],
     ) -> Optional[Dict[str, Any]]:
         """
         Transform a single Xray test case to Qase case format.
@@ -86,26 +128,43 @@ class CaseTransformer(BaseTransformer):
         Returns:
             Qase case payload or None if transformation fails
         """
-        jira_data = test_case.get("jira", {})
-        summary = jira_data.get("summary", "")
+        jira_data = test_case.get("jira", {}) or {}
+        summary = jira_data.get("summary", "") or ""
+        raw_summary = summary.strip()
         description_doc = jira_data.get("description", {})
+        issue_id = test_case.get("issueId")
+        jira_key = jira_data.get("key") or ""
         
         # Convert description to markdown
         description = ""
         if description_doc:
             description = self.convert_jira_doc_to_markdown(description_doc)
         
-        # Process steps
+        # Process steps (Qase requires non-empty step action; omit steps that are entirely empty)
         steps = []
-        xray_steps = test_case.get("steps", [])
+        xray_steps = test_case.get("steps") or []
+        if not isinstance(xray_steps, list):
+            xray_steps = []
         case_attachments = []
         
+        def _step_field_as_text(field: Any) -> str:
+            if field is None:
+                return ""
+            if isinstance(field, dict):
+                return self.convert_jira_doc_to_markdown(field)
+            if isinstance(field, str):
+                return field
+            return str(field)
+        
         for step in xray_steps:
-            action = step.get("action", "")
-            result = step.get("result", "")
+            if not isinstance(step, dict):
+                continue
+            action = _step_field_as_text(step.get("action"))
+            result = _step_field_as_text(step.get("result"))
             data = step.get("data", "")
+            if not isinstance(data, str):
+                data = str(data) if data is not None else ""
             
-            # Process attachments in step content
             action_processed, action_attachments = self.replace_attachment_references(
                 action, attachments_map
             )
@@ -116,11 +175,21 @@ class CaseTransformer(BaseTransformer):
             case_attachments.extend(action_attachments)
             case_attachments.extend(result_attachments)
             
+            action_clean = (action_processed or "").strip()
+            result_clean = (result_processed or "").strip()
+            data_clean = (data or "").strip()
+            
+            if not action_clean and not result_clean and not data_clean:
+                continue
+            
+            if not action_clean:
+                action_clean = "."
+            
             qase_step = {
-                "action": action_processed or "",
-                "expected_result": result_processed or "",
-                "data": data or "",
-                "position": len(steps) + 1
+                "action": action_clean,
+                "expected_result": result_clean,
+                "data": data_clean,
+                "position": len(steps) + 1,
             }
             steps.append(qase_step)
         
@@ -168,7 +237,8 @@ class CaseTransformer(BaseTransformer):
                     break
         
         # Map test type
-        test_type = test_case.get("testType", {}).get("name", "Manual")
+        test_type_obj = test_case.get("testType") or {}
+        test_type = (test_type_obj.get("name", "Manual") or "Manual") if isinstance(test_type_obj, dict) else "Manual"
         automation = 0  # Manual by default
         if test_type.lower() in ["automated", "automation", "cucumber", "gherkin"]:
             automation = 1
@@ -177,9 +247,25 @@ class CaseTransformer(BaseTransformer):
         labels = jira_data.get("labels", [])
         if isinstance(labels, str):
             labels = [l.strip() for l in labels.split(",")]
+        if isinstance(labels, list):
+            labels = [str(l).strip() for l in labels if l is not None and str(l).strip()]
+        
+        title = raw_summary
+        if len(title) > 255:
+            title = title[:252].rstrip() + "..."
+        if not title:
+            title = (jira_key or f"Xray test {issue_id}" or "Untitled test case").strip()[:255]
+        if (project_code, raw_summary) in duplicate_title_pairs:
+            tag = (jira_key or str(issue_id) or "").strip()
+            if tag:
+                suf = f" ({tag})"
+                if len(title) + len(suf) > 255:
+                    title = title[: max(0, 255 - len(suf))].rstrip() + suf
+                else:
+                    title = title + suf
         
         qase_case = {
-            "title": summary,
+            "title": title,
             "description": description,
             "preconditions": "",
             "postconditions": "",

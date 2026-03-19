@@ -239,15 +239,36 @@ class QaseService:
             # Convert dict cases to SDK models
             case_models = []
             for case_data in cases:
+                raw_title = case_data.get("title")
+                if isinstance(raw_title, str):
+                    title = raw_title.strip()
+                elif raw_title is not None:
+                    title = str(raw_title).strip()
+                else:
+                    title = ""
+                if len(title) > 255:
+                    title = title[:252].rstrip() + "..."
+                if not title:
+                    title = "Untitled test case"
                 # Convert steps if present
                 steps = []
                 if case_data.get("steps"):
                     for step_data in case_data["steps"]:
+                        action = (step_data.get("action") or "").strip()
+                        expected = (step_data.get("expected_result") or "").strip()
+                        data = step_data.get("data", "")
+                        if not isinstance(data, str):
+                            data = str(data) if data is not None else ""
+                        data = data.strip()
+                        if not action and not expected and not data:
+                            continue
+                        if not action:
+                            action = "."
                         step = TestStepCreate(
-                            action=step_data.get("action", ""),
-                            expected_result=step_data.get("expected_result", ""),
-                            data=step_data.get("data", ""),
-                            position=step_data.get("position", 0)
+                            action=action,
+                            expected_result=expected,
+                            data=data,
+                            position=len(steps) + 1,
                         )
                         steps.append(step)
                 
@@ -265,9 +286,15 @@ class QaseService:
                     params_final = None
                 
                 # Build case model, only include params if it's a valid dict
+                raw_tags = case_data.get("tags")
+                if isinstance(raw_tags, list) and raw_tags:
+                    tags_out = [str(t).strip() for t in raw_tags if t is not None and str(t).strip()]
+                else:
+                    tags_out = None
+
                 case_model_data = {
                     "id": case_data.get("id"),  # Optional, for preserve_ids
-                    "title": case_data.get("title"),
+                    "title": title,
                     "description": case_data.get("description", ""),
                     "preconditions": case_data.get("preconditions", ""),
                     "postconditions": case_data.get("postconditions", ""),
@@ -284,6 +311,7 @@ class QaseService:
                     "updated_at": case_data.get("updated_at"),
                     "steps": steps if steps else None,
                     "attachments": case_data.get("attachments", []),
+                    "tags": tags_out,
                     "custom_field": case_data.get("custom_field", {}),
                     "is_flaky": case_data.get("is_flaky", 0)
                 }
@@ -302,28 +330,42 @@ class QaseService:
             )
             
             if response.status:
-                # Convert response to dict format
-                # The response structure may vary - check what's actually available
                 created_cases = []
+                created_ids: List[Any] = []
                 if response.result:
-                    # Try different possible response structures
-                    if hasattr(response.result, 'cases') and response.result.cases:
-                        # If result has cases attribute
+                    if hasattr(response.result, "cases") and response.result.cases:
                         for case in response.result.cases:
                             created_cases.append({
-                                "id": getattr(case, 'id', None),
-                                "title": getattr(case, 'title', None)
+                                "id": getattr(case, "id", None),
+                                "title": getattr(case, "title", None),
                             })
-                    elif hasattr(response.result, 'ids') and response.result.ids:
-                        # If result has ids array (bulk response)
-                        for case_id in response.result.ids:
-                            created_cases.append({
-                                "id": case_id,
-                                "title": None  # Title not in ids-only response
-                            })
-                    # If no cases in response, cases were still created successfully
-                    # We'll return empty list but cases are in Qase
-                return {"cases": created_cases}
+                            cid = getattr(case, "id", None)
+                            if cid is not None:
+                                created_ids.append(cid)
+                    elif hasattr(response.result, "ids") and response.result.ids:
+                        created_ids = list(response.result.ids)
+                        for case_id in created_ids:
+                            created_cases.append({"id": case_id, "title": None})
+                requested = len(case_models)
+                got = len(created_ids) if created_ids else len(created_cases)
+                if got == 0 and requested > 0 and response.result:
+                    logger.warning(
+                        "Bulk case create succeeded but no ids/cases in response; "
+                        "cannot verify how many cases were created."
+                    )
+                if got != requested:
+                    logger.warning(
+                        "Bulk case create: Qase returned %s id(s) for %s case(s) sent. "
+                        "Unreturned items were likely skipped by the API (e.g. duplicate title).",
+                        got,
+                        requested,
+                    )
+                return {
+                    "cases": created_cases,
+                    "ids": created_ids,
+                    "requested": requested,
+                    "created_count": got,
+                }
             else:
                 raise Exception(f"Failed to create cases: {response}")
                 
@@ -363,9 +405,10 @@ class QaseService:
             )
             
             if response.status:
+                res = response.result
                 return {
-                    "id": response.result.id,
-                    "title": response.result.title
+                    "id": getattr(res, "id", None),
+                    "title": getattr(res, "title", None) or run_data.get("title"),
                 }
             else:
                 raise Exception(f"Failed to create run: {response}")
@@ -392,7 +435,8 @@ class QaseService:
             Response with created results
         """
         self._rate_limit()
-        logger.debug(f"Bulk creating {len(results)} results for run {run_id}")
+        run_id_int = int(run_id)
+        logger.debug(f"Bulk creating {len(results)} results for run {run_id_int}")
         
         try:
             # Convert dict results to SDK models
@@ -400,11 +444,18 @@ class QaseService:
             for result_data in results:
                 # Convert execution data
                 execution_data = result_data.get("execution", {})
+                exec_status = execution_data.get("status")
+                if not exec_status or not isinstance(exec_status, str):
+                    exec_status = "passed"
+                # Qase validates result execution times against the run start (often ~"now" when
+                # the run was just created). Xray exports real historical startedOn/finishedOn,
+                # which are always in the past vs that anchor → 422 "must be at least <unix>".
+                # Keep duration (and status); omit absolute timestamps for migration.
                 execution = ResultExecution(
-                    status=execution_data.get("status"),
+                    status=exec_status,
                     duration=execution_data.get("duration"),
-                    start_time=execution_data.get("start_time"),
-                    end_time=execution_data.get("end_time")
+                    start_time=None,
+                    end_time=None,
                 )
                 
                 # Convert steps if present
@@ -432,39 +483,61 @@ class QaseService:
                             # If enum doesn't exist or conversion fails, default to PASSED
                             step_status = ResultStepStatus.PASSED
                         
+                        action = (step_data_obj.get("action") or "").strip()
+                        if not action:
+                            action = "."
+                        step_att = step_exec_data.get("attachments") or []
+                        step_att_list = (
+                            [str(x) for x in step_att if x is not None]
+                            if isinstance(step_att, list)
+                            else []
+                        )
                         step = ResultStep(
                             data=ResultStepData(
-                                action=step_data_obj.get("action", ""),
-                                expected_result=step_data_obj.get("expected_result", "")
+                                action=action,
+                                expected_result=step_data_obj.get("expected_result") or ""
                             ),
                             execution=ResultStepExecution(
                                 status=step_status,
-                                comment=step_exec_data.get("comment", "")
+                                comment=step_exec_data.get("comment") or None,
+                                attachments=step_att_list or None,
                             )
                         )
                         steps.append(step)
                 
+                raw_title = result_data.get("title")
+                title = (
+                    raw_title.strip()
+                    if isinstance(raw_title, str)
+                    else (str(raw_title).strip() if raw_title is not None else "")
+                )
+                if not title:
+                    title = "Test result"
                 result_model = ResultCreate(
-                    title=result_data.get("title"),
+                    title=title,
                     testops_id=result_data.get("testops_id"),
                     execution=execution,
-                    message=result_data.get("message", ""),
-                    attachments=result_data.get("attachments", []),
+                    message=result_data.get("message") or "",
+                    attachments=result_data.get("attachments") or [],
                     steps=steps if steps else None
                 )
                 result_models.append(result_model)
             
             request = CreateResultsRequestV2(results=result_models)
-            response = self.results_api_v2.create_results_v2(
+            api_resp = self.results_api_v2.create_results_v2_with_http_info(
                 project_code=project_code,
-                run_id=run_id,
-                create_results_request_v2=request
+                run_id=run_id_int,
+                create_results_request_v2=request,
             )
-            
-            if response.status:
-                return {"status": "success"}
-            else:
-                raise Exception(f"Failed to create results: {response}")
+            # 202 + empty body → deserialized `data` can be None; do not touch .status on None
+            if api_resp.status_code not in (200, 202):
+                raise Exception(
+                    f"Failed to create results: HTTP {api_resp.status_code} {api_resp.raw_data!r}"
+                )
+            body = api_resp.data
+            if body is not None and getattr(body, "status", None) is False:
+                raise Exception(f"Failed to create results: {body}")
+            return {"status": "success"}
                 
         except Exception as e:
             logger.error(f"Error creating results: {e}")
