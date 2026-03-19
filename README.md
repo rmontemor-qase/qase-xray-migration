@@ -78,7 +78,7 @@ Runs that include **untested** results are left **in progress** (complete run is
 - **Test versions**, **parameters**, **iterations**, **datasets** on runs.
 - **Custom fields** on tests, executions, or run steps.
 - **Precondition** issues and precondition **results** (not fully queried/mapped).
-- **Assignee** / **executed by** → Qase users.
+- **Users** — Xray/Jira users are not created or synced in Qase; **assignee** and **executed by** are not applied to cases or results.
 - **Jira priority, components, epics, fix versions** → Qase case fields.
 - **Defects** as first-class Qase defects or guaranteed Jira **keys** (often ids only from GraphQL).
 - **Exact historical** result start/end times in Qase (duration preserved where possible).
