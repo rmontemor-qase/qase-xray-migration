@@ -279,7 +279,8 @@ class CaseTransformer(BaseTransformer):
             "steps": steps,
             "attachments": case_attachments,  # Hashes if available, will be updated after upload
             "tags": labels,  # Qase uses tags for labels
-            "_xray_issue_id": test_case.get("issueId"),  # Store for reference
+            "_xray_issue_id": test_case.get("issueId"),  # Store for reference / mappings
+            "_jira_issue_key": (jira_key or "").strip(),  # e.g. XSP-50 — used for preserve_xray_case_ids → Qase id
             "_folder_path": folder_path,  # Store for suite matching
             "_xray_attachment_ids": list(set(xray_attachment_ids))  # Store Xray IDs for later resolution
         }

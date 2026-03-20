@@ -18,6 +18,64 @@ from models.xray_models import (
 
 logger = get_logger(__name__)
 
+_FETCH_TEST_RUNS_QUERY = """
+query GetTestExecutionTestRuns($issueId: String!, $limit: Int!, $start: Int!) {
+  getTestExecution(issueId: $issueId) {
+    issueId
+    testRuns(limit: $limit, start: $start) {
+      total
+      start
+      limit
+      results {
+        id
+        status {
+          name
+          color
+        }
+        startedOn
+        finishedOn
+        test {
+          issueId
+        }
+        comment
+        defects
+        evidence {
+          id
+          filename
+          downloadLink
+          storedInJira
+          createdOn
+        }
+        steps {
+          id
+          status {
+            name
+          }
+          action
+          data
+          result
+          actualResult
+          comment
+          defects
+          evidence {
+            id
+            filename
+            downloadLink
+            storedInJira
+          }
+          attachments {
+            id
+            filename
+            downloadLink
+            storedInJira
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 
 class XrayCloudRepository:
     """
@@ -26,10 +84,9 @@ class XrayCloudRepository:
     Handles pagination, data transformation, and error handling.
     """
     
-    # GraphQL query limits
+    # GraphQL query limits (Xray caps per-request limit at 100 for most connections)
     MAX_LIMIT = 100  # Max items per query
-    MAX_TOTAL = 10000  # Max total items per call
-    
+
     def __init__(self, graphql_client: GraphQLClient):
         """
         Initialize repository with GraphQL client.
@@ -164,17 +221,78 @@ class XrayCloudRepository:
                     break
                 
                 start += limit
-                
-                if start >= self.MAX_TOTAL:
-                    logger.warning(f"Reached maximum limit of {self.MAX_TOTAL} tests")
-                    break
-                    
+
             except Exception as e:
                 logger.error(f"Error fetching tests (start={start}): {e}")
                 break
         
         logger.info(f"Fetched {len(all_tests)} tests for project {project_key}")
         return all_tests
+
+    def _fetch_all_test_runs_for_execution(self, execution_issue_id: str) -> Dict[str, Any]:
+        """
+        Load all test runs for one execution using testRuns(limit, start) until a short page
+        or total is reached. Per-execution pagination avoids silent truncation when bulk
+        getTestExecutions returns many executions (shared variables would not apply per row).
+        """
+        all_results: List[Dict[str, Any]] = []
+        start = 0
+        limit = self.MAX_LIMIT
+        page = 1
+        reported_total: Optional[int] = None
+
+        while True:
+            try:
+                variables = {
+                    "issueId": execution_issue_id,
+                    "limit": limit,
+                    "start": start,
+                }
+                response = self.client.execute_query(_FETCH_TEST_RUNS_QUERY, variables)
+                tex = response.get("getTestExecution")
+                if not tex:
+                    logger.warning(
+                        "getTestExecution returned no data for execution issueId=%s",
+                        execution_issue_id,
+                    )
+                    break
+
+                tr_block = tex.get("testRuns") or {}
+                results = tr_block.get("results") or []
+                if reported_total is None:
+                    t = tr_block.get("total")
+                    if t is not None:
+                        reported_total = int(t)
+
+                logger.info(
+                    "Fetching test run page %s for execution %s (%s runs so far)",
+                    page,
+                    execution_issue_id,
+                    len(all_results) + len(results),
+                )
+                all_results.extend(results)
+
+                if len(results) < limit:
+                    break
+                if reported_total is not None and len(all_results) >= reported_total:
+                    break
+                if len(results) == 0:
+                    break
+
+                start += limit
+                page += 1
+
+            except Exception as e:
+                logger.error(
+                    "Error fetching test runs for execution %s (start=%s): %s",
+                    execution_issue_id,
+                    start,
+                    e,
+                )
+                break
+
+        out_total = reported_total if reported_total is not None else len(all_results)
+        return {"total": out_total, "results": all_results}
     
     def get_test_executions(
         self,
@@ -193,10 +311,13 @@ class XrayCloudRepository:
         
         all_executions = []
         start = 0
-        limit = 50  # Smaller limit for executions as they contain nested test runs
+        limit = 50  # Execution list page size (test runs loaded separately per execution)
         
         jql = f"project = '{project_key}'"
         
+        # testRuns are loaded per execution via getTestExecution + offset pagination (see
+        # _fetch_all_test_runs_for_execution); bulk getTestExecutions shares one limit/start
+        # across all rows, so nested pagination cannot be correct for batched results.
         query = """
         query GetTestExecutions($jql: String!, $limit: Int!, $start: Int!) {
           getTestExecutions(jql: $jql, limit: $limit, start: $start) {
@@ -204,54 +325,6 @@ class XrayCloudRepository:
             results {
               issueId
               projectId
-              testRuns(limit: 100) {
-                total
-                results {
-                  id
-                  status {
-                    name
-                    color
-                  }
-                  startedOn
-                  finishedOn
-                  test {
-                    issueId
-                  }
-                  comment
-                  defects
-                  evidence {
-                    id
-                    filename
-                    downloadLink
-                    storedInJira
-                    createdOn
-                  }
-                  steps {
-                    id
-                    status {
-                      name
-                    }
-                    action
-                    data
-                    result
-                    actualResult
-                    comment
-                    defects
-                    evidence {
-                      id
-                      filename
-                      downloadLink
-                      storedInJira
-                    }
-                    attachments {
-                      id
-                      filename
-                      downloadLink
-                      storedInJira
-                    }
-                  }
-                }
-              }
               jira(fields: ["summary", "description", "project"])
             }
           }
@@ -288,17 +361,21 @@ class XrayCloudRepository:
                     break
                 
                 start += limit
-                
-                # Safety check
-                if start >= self.MAX_TOTAL:
-                    logger.warning(f"Reached maximum limit of {self.MAX_TOTAL} test executions")
-                    break
-                    
+
             except Exception as e:
                 logger.error(f"Error fetching test executions (start={start}): {e}")
                 break
         
         logger.info(f"Fetched {len(all_executions)} test executions for project {project_key}")
+
+        for execution in tqdm(all_executions, desc="Test runs per execution"):
+            issue_id = execution.get("issueId")
+            if issue_id is None:
+                execution["testRuns"] = {"total": 0, "results": []}
+                logger.warning("Test execution missing issueId; skipping test runs")
+                continue
+            execution["testRuns"] = self._fetch_all_test_runs_for_execution(str(issue_id))
+
         return all_executions
     
     def get_folders(

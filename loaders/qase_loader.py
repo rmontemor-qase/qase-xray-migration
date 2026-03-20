@@ -18,6 +18,19 @@ from transformers.xray_transformer import (
 logger = get_logger(__name__)
 
 
+def _jira_key_issue_number(key: str) -> Optional[int]:
+    """Trailing number from a Jira issue key (e.g. ``XSP-50`` → ``50``). Not the internal issue id."""
+    if not key or not isinstance(key, str):
+        return None
+    s = key.strip()
+    if "-" not in s:
+        return None
+    suffix = s.rsplit("-", 1)[-1].strip()
+    if suffix.isdigit():
+        return int(suffix)
+    return None
+
+
 class QaseLoader:
     """
     Loads transformed data into Qase.
@@ -35,7 +48,8 @@ class QaseLoader:
         self,
         cache_manager: CacheManager,
         qase_service: QaseService,
-        mappings: MappingStore
+        mappings: MappingStore,
+        preserve_xray_case_ids: bool = False,
     ):
         """
         Initialize loader.
@@ -44,10 +58,12 @@ class QaseLoader:
             cache_manager: CacheManager instance for reading transformed data
             qase_service: QaseService instance for API calls
             mappings: MappingStore for tracking ID mappings
+            preserve_xray_case_ids: If True, bulk-create cases with Qase id = Jira numeric issue id (Xray test issueId)
         """
         self.cache_manager = cache_manager
         self.qase_service = qase_service
         self.mappings = mappings
+        self.preserve_xray_case_ids = preserve_xray_case_ids
         
         self.stats = {
             "projects": 0,
@@ -67,7 +83,12 @@ class QaseLoader:
             Dictionary with loading statistics
         """
         logger.info("Starting Qase data import...")
-        
+        if self.preserve_xray_case_ids:
+            logger.info(
+                "preserve_xray_case_ids is enabled: Qase case id = number from Jira issue key "
+                "(e.g. XSP-50 → 50) so cards match Jira; falls back to internal issue id if key is missing"
+            )
+
         try:
             # Load transformed data
             transformed_dir = self.cache_manager.cache_dir / "transformed"
@@ -371,8 +392,28 @@ class QaseLoader:
         
         return suite_maps
     
+    def _xray_issue_id_to_jira_key_map(self) -> Dict[str, str]:
+        """Map Xray/Jira test issueId → Jira issue key from raw extract (for older transformed caches)."""
+        raw = self._load_json(self.cache_manager.cache_dir / "raw" / "test_cases.json")
+        out: Dict[str, str] = {}
+        for tc in raw or []:
+            if not isinstance(tc, dict):
+                continue
+            iid = tc.get("issueId")
+            if iid is None:
+                continue
+            jira = tc.get("jira") or {}
+            k = jira.get("key")
+            if k:
+                out[str(iid).strip()] = str(k).strip()
+        return out
+
     def _load_cases(self, cases: Dict[str, List[Dict[str, Any]]], suite_maps: Dict[str, Dict[str, int]]):
         """Load cases into Qase (bulk)."""
+        issue_id_to_key: Dict[str, str] = {}
+        if self.preserve_xray_case_ids:
+            issue_id_to_key = self._xray_issue_id_to_jira_key_map()
+
         for project_code, case_list in cases.items():
             # Update suite IDs in cases using the suite map from loaded suites
             suite_map = suite_maps.get(project_code, {})
@@ -392,6 +433,34 @@ class QaseLoader:
                 clean_batch = []
                 for case in batch:
                     clean_case = {k: v for k, v in case.items() if not k.startswith("_")}
+                    if self.preserve_xray_case_ids:
+                        jira_key = (case.get("_jira_issue_key") or "").strip()
+                        if not jira_key:
+                            xlookup = case.get("_xray_issue_id")
+                            if xlookup is not None:
+                                jira_key = issue_id_to_key.get(str(xlookup).strip(), "")
+                        qid = _jira_key_issue_number(jira_key) if jira_key else None
+                        if qid is not None:
+                            clean_case["id"] = qid
+                        else:
+                            xid = case.get("_xray_issue_id")
+                            if xid is not None:
+                                xs = str(xid).strip()
+                                if xs.isdigit():
+                                    clean_case["id"] = int(xs)
+                                    logger.debug(
+                                        "preserve_xray_case_ids: no parsable Jira key for case %r; "
+                                        "using internal issue id %s",
+                                        case.get("title"),
+                                        xs,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "preserve_xray_case_ids: cannot derive id (key=%r, issueId=%r) for %r",
+                                        jira_key or None,
+                                        xid,
+                                        case.get("title"),
+                                    )
                     clean_batch.append(clean_case)
                 
                 try:

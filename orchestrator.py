@@ -86,7 +86,12 @@ class MigrationOrchestrator:
             # Use the same mappings instance as transformer
             if self.mappings is None:
                 self.mappings = self.transformer.mappings
-            self.loader = QaseLoader(self.cache_manager, qase_service, self.mappings)
+            self.loader = QaseLoader(
+                self.cache_manager,
+                qase_service,
+                self.mappings,
+                preserve_xray_case_ids=bool(config.get("preserve_xray_case_ids", False)),
+            )
     
     def _validate_config(self):
         """Validate configuration file."""

@@ -36,6 +36,7 @@ Scope is **Xray Cloud** via GraphQL plus **Jira Cloud** REST where noted. The ta
 | Xray **test type** name | **Automation** flag (heuristic) |
 | Xray **folder** path | **Suite** after suites are created |
 | Jira **attachments**; wiki `!file!` / `[^file]` | Upload to Qase; links rewritten to **Qase CDN URLs** on load |
+| Jira **issue key** number (optional) | Qase case **`id`** when `preserve_xray_case_ids` is `true`: uses the key suffix (`XSP-50` → **50**) so Qase cards match Jira; falls back to internal issue id only if the key is missing |
 
 **Not mapped from Xray/Jira (fixed Qase defaults today):** `preconditions`, `postconditions`, `severity`, `priority`, `type`, `behavior`, `status`.
 
@@ -83,7 +84,6 @@ Runs that include **untested** results are left **in progress** (complete run is
 - **Defects** as first-class Qase defects or guaranteed Jira **keys** (often ids only from GraphQL).
 - **Exact historical** result start/end times in Qase (duration preserved where possible).
 - **Xray Server / Data Center** (Cloud only).
-- GraphQL **pagination** limits (very large projects; `testRuns(limit: 100)` per execution in the current query may truncate heavy executions).
 - **Qase** shared steps, custom fields on entities, and external integrations driven from Xray.
 
 ---
@@ -151,6 +151,7 @@ Optional OAuth (alternative or additional path, depending on your setup):
 | Field | Description |
 | --- | --- |
 | `cache_dir` | Parent directory for timestamped extraction folders (default: `cache`) |
+| `preserve_xray_case_ids` | If `true`, bulk case creation sets Qase **`id`** from the Jira **issue key** suffix (e.g. `XSP-50` → `50`), so the case id in Qase matches what you see in Jira—not Jira’s unrelated internal numeric id (which produced ids like `XSP-1120`). If the key is missing, falls back to internal `issueId`. Default `false`. Applied at **load** time; older caches without `_jira_issue_key` still resolve keys from `raw/test_cases.json`. Use an empty Qase project or delete mistaken cases before reloading. |
 
 **Security:** Never commit `config.json`. Use scoped Jira tokens where possible and rotate credentials if exposed.
 

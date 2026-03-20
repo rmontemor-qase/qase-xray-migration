@@ -292,8 +292,20 @@ class QaseService:
                 else:
                     tags_out = None
 
+                requested_id: Optional[int] = None
+                raw_case_id = case_data.get("id")
+                if raw_case_id is not None:
+                    try:
+                        requested_id = int(raw_case_id)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Bulk case %r: ignoring invalid id %r (expected integer)",
+                            title,
+                            raw_case_id,
+                        )
+
                 case_model_data = {
-                    "id": case_data.get("id"),  # Optional, for preserve_ids
+                    "id": requested_id,
                     "title": title,
                     "description": case_data.get("description", ""),
                     "preconditions": case_data.get("preconditions", ""),

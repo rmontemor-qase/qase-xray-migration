@@ -6,5 +6,6 @@
   "jira_email": "your.email@example.com",
   "jira_api_token": "YOUR_JIRA_API_TOKEN",
   "qase_host": "https://api.qase.io/v1",
-  "qase_api_token": "YOUR_QASE_API_TOKEN"
+  "qase_api_token": "YOUR_QASE_API_TOKEN",
+  "preserve_xray_case_ids": false
 }
