@@ -174,7 +174,7 @@ class XrayCloudRepository:
                 action
                 result
               }
-              jira(fields: ["key", "summary", "description", "labels", "attachment", "project"])
+              jira(fields: ["key", "summary", "description", "labels", "attachment", "project", "priority"])
             }
           }
         }

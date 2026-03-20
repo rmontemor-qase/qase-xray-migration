@@ -1,7 +1,7 @@
 """Qase API service using Python SDK."""
 
 import time
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 import certifi
 
@@ -12,6 +12,7 @@ from qase.api_client_v1.api.suites_api import SuitesApi
 from qase.api_client_v1.api.cases_api import CasesApi
 from qase.api_client_v1.api.attachments_api import AttachmentsApi
 from qase.api_client_v1.api.runs_api import RunsApi
+from qase.api_client_v1.api.system_fields_api import SystemFieldsApi
 from qase.api_client_v1.models import (
     ProjectCreate,
     SuiteCreate,
@@ -91,12 +92,83 @@ class QaseService:
         self.cases_api = CasesApi(self.client_v1)
         self.attachments_api = AttachmentsApi(self.client_v1)
         self.runs_api = RunsApi(self.client_v1)
+        self.system_fields_api = SystemFieldsApi(self.client_v1)
         self.results_api_v2 = ResultsApiV2(self.client_v2)
-        
+        self._system_fields_list: Optional[List[Any]] = None
+
         # Rate limiting: ~230 requests per 10 seconds for cloud
         self.rate_limit_delay = 0.05  # ~20 requests per second
         self.last_request_time = 0
-    
+
+    def load_system_fields(self) -> None:
+        """Fetch Qase system fields once (priority / case type option ids are workspace-specific)."""
+        if self._system_fields_list is not None:
+            return
+        self._rate_limit()
+        try:
+            resp = self.system_fields_api.get_system_fields()
+            self._system_fields_list = list(resp.result or [])
+            logger.info("Loaded %s Qase system field definitions", len(self._system_fields_list))
+        except Exception as e:
+            logger.warning("Could not load Qase system fields (priority/type mapping may be skipped): %s", e)
+            self._system_fields_list = []
+
+    def _system_field_by_slug(self, slug: str) -> Optional[Any]:
+        self.load_system_fields()
+        want = (slug or "").strip().lower()
+        for f in self._system_fields_list or []:
+            if (getattr(f, "slug", None) or "").strip().lower() == want:
+                return f
+        return None
+
+    def resolve_priority_id_by_jira_name(self, jira_priority_name: Optional[str]) -> Optional[int]:
+        """
+        Map Jira priority display name to Qase priority option id using GET /system_field.
+        """
+        if not jira_priority_name or not str(jira_priority_name).strip():
+            return None
+        field = self._system_field_by_slug("priority")
+        options = getattr(field, "options", None) or []
+        if not options:
+            logger.debug("No Qase priority system field options; cannot map %r", jira_priority_name)
+            return None
+        n = str(jira_priority_name).strip().lower()
+        # Exact title or slug match
+        for opt in options:
+            title = (getattr(opt, "title", None) or "").strip().lower()
+            slug = (getattr(opt, "slug", None) or "").strip().lower()
+            if title == n or slug == n:
+                oid = getattr(opt, "id", None)
+                return int(oid) if oid is not None else None
+        # Substring / containment (Jira often uses "High", Qase "High priority", etc.)
+        for opt in options:
+            title = (getattr(opt, "title", None) or "").strip().lower()
+            slug = (getattr(opt, "slug", None) or "").strip().lower()
+            if title and (n in title or title in n):
+                oid = getattr(opt, "id", None)
+                return int(oid) if oid is not None else None
+            if slug and (n in slug or slug in n):
+                oid = getattr(opt, "id", None)
+                return int(oid) if oid is not None else None
+        # English Jira defaults → keyword match on option title/slug
+        bucket: Optional[str] = None
+        if any(x in n for x in ("highest", "blocker", "critical", "p1", "severe")):
+            bucket = "critical"
+        elif "high" in n or "major" in n or "p2" in n:
+            bucket = "high"
+        elif "medium" in n or "normal" in n or "moderate" in n or "p3" in n:
+            bucket = "medium"
+        elif any(x in n for x in ("low", "lowest", "trivial", "minor", "p4", "p5")):
+            bucket = "low"
+        if bucket:
+            for opt in options:
+                blob = f"{getattr(opt, 'title', '')} {getattr(opt, 'slug', '')}".lower()
+                if bucket in blob:
+                    oid = getattr(opt, "id", None)
+                    return int(oid) if oid is not None else None
+        logger.debug("No Qase priority option matched Jira name %r", jira_priority_name)
+        return None
+
     def _rate_limit(self):
         """Apply rate limiting."""
         current_time = time.time()
@@ -304,34 +376,46 @@ class QaseService:
                             raw_case_id,
                         )
 
-                case_model_data = {
-                    "id": requested_id,
+                # Omit optional ids when unset so Qase applies workspace defaults (sending priority=1 is
+                # often "High" in Qase, not low).
+                case_model_data: Dict[str, Any] = {
                     "title": title,
                     "description": case_data.get("description", ""),
                     "preconditions": case_data.get("preconditions", ""),
                     "postconditions": case_data.get("postconditions", ""),
-                    "severity": case_data.get("severity"),
-                    "priority": case_data.get("priority"),
-                    "type": case_data.get("type"),
                     "behavior": case_data.get("behavior"),
                     "automation": case_data.get("automation", 0),
                     "status": case_data.get("status", 1),
-                    "suite_id": case_data.get("suite_id"),
-                    "milestone_id": case_data.get("milestone_id"),
-                    "author_id": case_data.get("author_id"),
-                    "created_at": case_data.get("created_at"),
-                    "updated_at": case_data.get("updated_at"),
-                    "steps": steps if steps else None,
                     "attachments": case_data.get("attachments", []),
                     "tags": tags_out,
                     "custom_field": case_data.get("custom_field", {}),
-                    "is_flaky": case_data.get("is_flaky", 0)
+                    "is_flaky": case_data.get("is_flaky", 0),
                 }
-                
+                if requested_id is not None:
+                    case_model_data["id"] = requested_id
+                if case_data.get("severity") is not None:
+                    case_model_data["severity"] = case_data["severity"]
+                if case_data.get("priority") is not None:
+                    case_model_data["priority"] = int(case_data["priority"])
+                if case_data.get("type") is not None:
+                    case_model_data["type"] = int(case_data["type"])
+                if case_data.get("suite_id") is not None:
+                    case_model_data["suite_id"] = int(case_data["suite_id"])
+                if case_data.get("milestone_id") is not None:
+                    case_model_data["milestone_id"] = int(case_data["milestone_id"])
+                if case_data.get("author_id") is not None:
+                    case_model_data["author_id"] = int(case_data["author_id"])
+                if case_data.get("created_at") is not None:
+                    case_model_data["created_at"] = case_data["created_at"]
+                if case_data.get("updated_at") is not None:
+                    case_model_data["updated_at"] = case_data["updated_at"]
+                if steps:
+                    case_model_data["steps"] = steps
+
                 # Only add params if it's a valid dict
                 if params_final is not None:
                     case_model_data["params"] = params_final
-                
+
                 case_model = TestCasebulkCasesInner(**case_model_data)
                 case_models.append(case_model)
             
@@ -554,7 +638,7 @@ class QaseService:
         except Exception as e:
             logger.error(f"Error creating results: {e}")
             raise
-    
+
     def complete_run(self, project_code: str, run_id: int) -> Dict[str, Any]:
         """
         Complete a test run in Qase.

@@ -58,7 +58,7 @@ class QaseLoader:
             cache_manager: CacheManager instance for reading transformed data
             qase_service: QaseService instance for API calls
             mappings: MappingStore for tracking ID mappings
-            preserve_xray_case_ids: If True, bulk-create cases with Qase id = Jira numeric issue id (Xray test issueId)
+            preserve_xray_case_ids: If True, bulk-create cases with Qase id from Jira issue key number (fallback: internal issue id)
         """
         self.cache_manager = cache_manager
         self.qase_service = qase_service
@@ -410,6 +410,8 @@ class QaseLoader:
 
     def _load_cases(self, cases: Dict[str, List[Dict[str, Any]]], suite_maps: Dict[str, Dict[str, int]]):
         """Load cases into Qase (bulk)."""
+        self.qase_service.load_system_fields()
+
         issue_id_to_key: Dict[str, str] = {}
         if self.preserve_xray_case_ids:
             issue_id_to_key = self._xray_issue_id_to_jira_key_map()
@@ -423,7 +425,19 @@ class QaseLoader:
                     case["suite_id"] = suite_map[folder_path]
                 elif folder_path:
                     logger.debug(f"Case {case.get('title')} has folder path {folder_path} but no matching suite found")
-            
+
+            for case in case_list:
+                pname = case.pop("_jira_priority_name", None)
+                if pname:
+                    qpid = self.qase_service.resolve_priority_id_by_jira_name(pname)
+                    if qpid is not None:
+                        case["priority"] = qpid
+                    else:
+                        case.pop("priority", None)
+                else:
+                    # Drop any stale numeric priority from old transformed caches (e.g. mistaken 1 = "low")
+                    case.pop("priority", None)
+
             # Process in batches of 100 (Qase limit)
             batch_size = 100
             for i in tqdm(range(0, len(case_list), batch_size), desc=f"Creating cases for {project_code}"):
@@ -645,9 +659,8 @@ class QaseLoader:
                             clean_results.append(clean_result)
                     
                     if clean_results:
-                        # Process in batches of 500
-                        batch_size = 500
                         results_batches_ok = True
+                        batch_size = 500
                         for i in range(0, len(clean_results), batch_size):
                             batch = clean_results[i:i + batch_size]
                             try:

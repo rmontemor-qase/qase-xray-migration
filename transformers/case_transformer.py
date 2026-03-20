@@ -10,6 +10,18 @@ from transformers.xray_transformer import BaseTransformer
 logger = get_logger(__name__)
 
 
+def _jira_priority_display_name(jira_data: Dict[str, Any]) -> Optional[str]:
+    p = jira_data.get("priority")
+    if isinstance(p, dict):
+        for key in ("name", "displayName", "label"):
+            v = p.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    if isinstance(p, str) and p.strip():
+        return p.strip()
+    return None
+
+
 class CaseTransformer(BaseTransformer):
     """Transforms Xray test cases to Qase cases."""
     
@@ -242,7 +254,9 @@ class CaseTransformer(BaseTransformer):
         automation = 0  # Manual by default
         if test_type.lower() in ["automated", "automation", "cucumber", "gherkin"]:
             automation = 1
-        
+
+        jira_priority_name = _jira_priority_display_name(jira_data)
+
         # Extract labels
         labels = jira_data.get("labels", [])
         if isinstance(labels, str):
@@ -270,7 +284,6 @@ class CaseTransformer(BaseTransformer):
             "preconditions": "",
             "postconditions": "",
             "severity": 2,  # Normal (default)
-            "priority": 1,  # Low (default)
             "type": 1,      # Functional (default)
             "behavior": 1,   # Positive (default)
             "automation": automation,
@@ -281,6 +294,7 @@ class CaseTransformer(BaseTransformer):
             "tags": labels,  # Qase uses tags for labels
             "_xray_issue_id": test_case.get("issueId"),  # Store for reference / mappings
             "_jira_issue_key": (jira_key or "").strip(),  # e.g. XSP-50 — used for preserve_xray_case_ids → Qase id
+            "_jira_priority_name": jira_priority_name,
             "_folder_path": folder_path,  # Store for suite matching
             "_xray_attachment_ids": list(set(xray_attachment_ids))  # Store Xray IDs for later resolution
         }

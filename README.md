@@ -37,8 +37,9 @@ Scope is **Xray Cloud** via GraphQL plus **Jira Cloud** REST where noted. The ta
 | Xray **folder** path | **Suite** after suites are created |
 | Jira **attachments**; wiki `!file!` / `[^file]` | Upload to Qase; links rewritten to **Qase CDN URLs** on load |
 | Jira **issue key** number (optional) | Qase case **`id`** when `preserve_xray_case_ids` is `true`: uses the key suffix (`XSP-50` → **50**) so Qase cards match Jira; falls back to internal issue id only if the key is missing |
+| Jira **priority** (from GraphQL `jira.priority`) | Qase **priority** id resolved via **`GET /v1/system_field`** (workspace-specific option ids). If Jira has no priority or Qase has no match, priority is omitted so the project default applies. |
 
-**Not mapped from Xray/Jira (fixed Qase defaults today):** `preconditions`, `postconditions`, `severity`, `priority`, `type`, `behavior`, `status`.
+**Not mapped from Xray/Jira (fixed Qase defaults today):** `preconditions`, `postconditions`, `severity`, `type`, `behavior`, `status`.
 
 ### Attachments (files)
 
@@ -80,7 +81,7 @@ Runs that include **untested** results are left **in progress** (complete run is
 - **Custom fields** on tests, executions, or run steps.
 - **Precondition** issues and precondition **results** (not fully queried/mapped).
 - **Users** — Xray/Jira users are not created or synced in Qase; **assignee** and **executed by** are not applied to cases or results.
-- **Jira priority, components, epics, fix versions** → Qase case fields.
+- **Jira components, epics, fix versions** → Qase case fields (priority **is** mapped when present; re-**extract** + **transform** after upgrading so `priority` is in raw `test_cases.json`).
 - **Defects** as first-class Qase defects or guaranteed Jira **keys** (often ids only from GraphQL).
 - **Exact historical** result start/end times in Qase (duration preserved where possible).
 - **Xray Server / Data Center** (Cloud only).
