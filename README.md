@@ -32,7 +32,7 @@ Scope is **Xray Cloud** via GraphQL plus **Jira Cloud** REST where noted. The ta
 | Jira **summary** | Case **title** (duplicate titles disambiguated with issue key) |
 | Jira **description** (ADF, string, or HTML-ish) | Case **description** (Markdown where conversion applies) |
 | Jira **labels** | **Tags** |
-| Xray **steps** (`action`, `result`, `data`) | Case **steps** |
+| Xray **steps** (`action`, `result`, `data`); for Cucumber tests GraphQL **steps** is often empty, so we request **`gherkin`** / **`unstructured`** and synthesize step rows (Given/When/Then lines or one unstructured block) for the same case **steps** mapping | Case **steps** |
 | Xray **test type** name | **Automation** flag (heuristic) |
 | Xray **folder** path | **Suite** after suites are created |
 | Jira **attachments**; wiki `!file!` / `[^file]` | Upload to Qase; links rewritten to **Qase CDN URLs** on load |
@@ -76,7 +76,7 @@ Runs that include **untested** results are left **in progress** (complete run is
 ## What we do **not** migrate yet
 
 - **Test plans**, **test sets**, **boards**, **requirements** / coverage reporting.
-- **Cucumber/Gherkin** as structured scenarios (only a coarse automation hint from test type).
+- **Gherkin** beyond step-shaped text: full **`scenarioType`**, feature files, and tables are kept in raw JSON but not modeled separately in Qase (steps are line-based Gherkin actions where we can parse them).
 - **Test versions**, **parameters**, **iterations**, **datasets** on runs.
 - **Custom fields** on tests, executions, or run steps.
 - **Precondition** issues and precondition **results** (not fully queried/mapped).

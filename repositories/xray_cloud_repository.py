@@ -1,5 +1,6 @@
 """Repository for accessing Xray Cloud GraphQL API."""
 
+import re
 from typing import List, Dict, Any, Optional
 
 from tqdm import tqdm
@@ -17,6 +18,73 @@ from models.xray_models import (
 )
 
 logger = get_logger(__name__)
+
+
+def _gherkin_lines_to_synthetic_steps(issue_id: str, gherkin: str) -> List[Dict[str, Any]]:
+    """
+    Build Xray-shaped step dicts from Gherkin text. Xray stores Cucumber specs in ``gherkin``,
+    not in ``steps``; GraphQL ``steps`` is often empty for those tests.
+    """
+    steps: List[Dict[str, Any]] = []
+    iid = (issue_id or "x").strip() or "x"
+    for raw in (gherkin or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("@"):
+            continue
+        # Scenario outline example rows / tables
+        if re.match(r"^\|.*\|$", line):
+            continue
+        if re.match(r"^(Given|When|Then|And|But)\s+", line, re.IGNORECASE):
+            steps.append(
+                {
+                    "id": f"gherkin-{iid}-{len(steps) + 1}",
+                    "data": "",
+                    "action": line,
+                    "result": "",
+                }
+            )
+    return steps
+
+
+def _enrich_test_steps_from_xray_definitions(test: Dict[str, Any]) -> None:
+    """If ``steps`` is empty, fill from ``gherkin`` or ``unstructured`` (GraphQL Test fields)."""
+    if not isinstance(test, dict):
+        return
+    steps = test.get("steps")
+    has_real_steps = False
+    if isinstance(steps, list):
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            if s.get("action") or s.get("result") or s.get("data"):
+                has_real_steps = True
+                break
+    if has_real_steps:
+        return
+    iid = str(test.get("issueId") or "x").strip() or "x"
+    gh = (test.get("gherkin") or "").strip()
+    if gh:
+        syn = _gherkin_lines_to_synthetic_steps(iid, gh)
+        if syn:
+            test["steps"] = syn
+            logger.debug(
+                "Synthesized %s step(s) from gherkin for test issueId=%s",
+                len(syn),
+                iid,
+            )
+        return
+    uns = (test.get("unstructured") or "").strip()
+    if uns:
+        test["steps"] = [
+            {
+                "id": f"unstructured-{iid}-1",
+                "data": "",
+                "action": uns if len(uns) <= 16000 else (uns[:15997] + "..."),
+                "result": "",
+            }
+        ]
+        logger.debug("Synthesized 1 step from unstructured for test issueId=%s", iid)
+
 
 _FETCH_TEST_RUNS_QUERY = """
 query GetTestExecutionTestRuns($issueId: String!, $limit: Int!, $start: Int!) {
@@ -168,6 +236,9 @@ class XrayCloudRepository:
               folder {
                 path
               }
+              gherkin
+              scenarioType
+              unstructured
               steps {
                 id
                 data
@@ -195,7 +266,10 @@ class XrayCloudRepository:
                 total = tests_data.get("total", 0)
                 start_pos = tests_data.get("start", start)
                 limit_val = tests_data.get("limit", limit)
-                
+
+                for row in results:
+                    _enrich_test_steps_from_xray_definitions(row)
+
                 all_tests.extend(results)
                 
                 logger.info(
